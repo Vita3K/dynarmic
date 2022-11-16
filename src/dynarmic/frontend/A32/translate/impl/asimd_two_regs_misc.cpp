@@ -552,9 +552,10 @@ bool TranslatorVisitor::asimd_VZIP(bool D, size_t sz, size_t Vd, bool Q, bool M,
     const auto d = ToVector(Q, Vd, D);
     const auto m = ToVector(Q, Vm, M);
 
-    if (d == m) {
-        return UnpredictableInstruction();
-    }
+    // Vita3K: ignore unpredictables, result is fine as it is even if its techincally ub
+    // if (d == m) {
+    //     return UnpredictableInstruction();
+    // }
 
     const auto reg_d = ir.GetVector(d);
     const auto reg_m = ir.GetVector(m);

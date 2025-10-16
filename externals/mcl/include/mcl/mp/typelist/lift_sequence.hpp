@@ -15,9 +15,9 @@ namespace detail {
 template<class VL>
 struct lift_sequence_impl;
 
-template<class T, template<class, T...> class VLT, T... values>
+template <template <class T, T...> class VLT, class T, T... values>
 struct lift_sequence_impl<VLT<T, values...>> {
-    using type = list<std::integral_constant<T, values>...>;
+  using type = list<std::integral_constant<T, values>...>;
 };
 
 }  // namespace detail

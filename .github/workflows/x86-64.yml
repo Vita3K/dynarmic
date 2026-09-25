@@ -9,7 +9,8 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ windows-latest, ubuntu-latest, macos-latest ]
+        # macos-latest is arm64; use an Intel runner to test the x86-64 backend.
+        os: [ windows-latest, ubuntu-latest, macos-15-intel ]
         cpu_detection: [ 0, 1 ]
       fail-fast: false
 
@@ -19,32 +20,31 @@ jobs:
 
       - name: Install build dependencies
         if: ${{matrix.os == 'ubuntu-latest'}}
-        run: sudo apt-get install llvm ninja-build
-
-      - name: Install build dependencies
-        if: ${{matrix.os == 'macos-latest'}}
-        run: |
-          brew install llvm ninja
-          echo "/usr/local/opt/llvm/bin" >> $GITHUB_PATH
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install
+          g++-10
+          llvm
+          ninja-build
 
       - name: Checkout dynarmic repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Checkout ext-boost repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
-          repository: MerryMage/ext-boost
+          repository: Vita3K/ext-boost
           path: externals/ext-boost
 
       - name: Checkout unicorn repo
-        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'}}
-        uses: actions/checkout@v2
+        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
+        uses: actions/checkout@v5
         with:
-          repository: MerryMage/unicorn
+          repository: yuzu-emu-mirror/unicorn
           path: externals/unicorn
 
       - name: Build unicorn
-        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'}}
+        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
         working-directory: externals/unicorn
         run: UNICORN_ARCHS=aarch64,arm ./make.sh
 
@@ -66,8 +66,9 @@ jobs:
           -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
           -G Ninja
 
+      # Uses the Homebrew LLVM that is preinstalled on the runner image.
       - name: Configure CMake
-        if: ${{matrix.os == 'macos-latest'}}
+        if: ${{matrix.os == 'macos-15-intel'}}
         run: >
           cmake
           -B ${{github.workspace}}/build
@@ -78,6 +79,7 @@ jobs:
           -DDYNARMIC_USE_LLVM=1
           -DLIBUNICORN_INCLUDE_DIR=${{github.workspace}}/externals/unicorn/include
           -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
+          -DLLVM_DIR=$(brew --prefix llvm@18)/lib/cmake/llvm
           -G Ninja
 
       - name: Configure CMake
@@ -88,7 +90,7 @@ jobs:
           -DBOOST_INCLUDEDIR=${{github.workspace}}/externals/ext-boost
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
           -DDYNARMIC_ENABLE_CPU_FEATURE_DETECTION=${{matrix.cpu_detection}}
-          -G "Visual Studio 17 2022"
+          -G "Visual Studio 18 2026"
           -A x64
 
       - name: Build

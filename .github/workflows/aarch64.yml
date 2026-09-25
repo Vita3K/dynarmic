@@ -22,20 +22,21 @@ jobs:
           sudo apt-get install
           gcc-10-aarch64-linux-gnu
           g++-10-aarch64-linux-gnu
+          g++-10
           ninja-build
           qemu-user
 
       - name: Checkout dynarmic repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Ccache
         if: matrix.platform == 'linux'
         uses: hendrikmuhs/ccache-action@v1.2
 
       - name: Checkout ext-boost repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
-          repository: MerryMage/ext-boost
+          repository: Vita3K/ext-boost
           path: externals/ext-boost
 
       - name: Configure CMake for AArch64 (Linux)
@@ -129,12 +130,12 @@ jobs:
     steps:
 
       - name: Checkout dynarmic repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Checkout ext-boost repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
-          repository: MerryMage/ext-boost
+          repository: Vita3K/ext-boost
           path: externals/ext-boost
 
       - name: Setup msvc-arm64 environment

@@ -39,6 +39,17 @@ using namespace Xbyak::util;
         }                            \
     }
 
+#define WDQCODE(NAME)                       \
+    [&code](auto... args) {                 \
+        if constexpr (esize == 16) {        \
+            code.NAME##w(args...);          \
+        } else if constexpr (esize == 32) { \
+            code.NAME##d(args...);          \
+        } else {                            \
+            code.NAME##q(args...);          \
+        }                                   \
+    }
+
 template<typename Function>
 static void EmitVectorOperation(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -593,7 +604,45 @@ static constexpr T VShift(T x, T y) {
     return static_cast<T>(static_cast<unsigned_type>(x) << static_cast<unsigned_type>(shift_amount));
 }
 
+// 8-bit elements are widened to 16 bits. Truncating the results back gives the same results as shifting 8-bit elements.
+template<bool is_signed>
+static void EmitVectorVShift8AVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm b = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+
+    const Xbyak::Ymm wide_a = ymm16;
+    const Xbyak::Ymm shift = ymm17;
+    const Xbyak::Ymm left_shift = ymm18;
+
+    if constexpr (is_signed) {
+        code.vpmovsxbw(wide_a, a);
+    } else {
+        code.vpmovzxbw(wide_a, a);
+    }
+    code.vpmovsxbw(shift, b);
+    code.vpmovw2m(k1, shift);
+
+    code.vpsllvw(left_shift, wide_a, shift);
+    code.vpabsw(shift, shift);
+    if constexpr (is_signed) {
+        code.vpsravw(wide_a, wide_a, shift);
+    } else {
+        code.vpsrlvw(wide_a, wide_a, shift);
+    }
+    code.vpblendmw(left_shift | k1, left_shift, wide_a);
+    code.vpmovwb(result, left_shift);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorArithmeticVShift8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorVShift8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s8>& result, const VectorArray<s8>& a, const VectorArray<s8>& b) {
         std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<s8>);
     });
@@ -1935,6 +1984,11 @@ void EmitX64::EmitVectorLogicalVShift8(EmitContext& ctx, IR::Inst* inst) {
         code.vgf2p8affineqb(result | negative_mask, result, xmm0, 0);
 
         ctx.reg_alloc.DefineValue(inst, result);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorVShift8AVX512<false>(code, ctx, inst);
         return;
     }
 
@@ -3821,24 +3875,34 @@ static void RoundingShiftLeft(VectorArray<T>& out, const VectorArray<T>& lhs, co
     }
 }
 
-template<size_t esize>
-static void EmitUnsignedRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
-    static_assert(esize == 32 || esize == 64);
+// Requires AVX2 for 32-bit elements and unsigned 64-bit elements, AVX512_Ortho for signed 64-bit elements,
+// and AVX512_Ortho with AVX512BW for 16-bit elements.
+template<size_t esize, bool is_signed>
+static void EmitRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(esize == 16 || esize == 32 || esize == 64);
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
     const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(args[0]);
     const Xbyak::Xmm b = ctx.reg_alloc.UseXmm(args[1]);
 
+    const auto shift_right = [&](const Xbyak::Xmm& dst, const Xbyak::Xmm& src, const Xbyak::Xmm& amount) {
+        if constexpr (is_signed) {
+            WDQCODE(vpsrav)(dst, src, amount);
+        } else {
+            WDQCODE(vpsrlv)(dst, src, amount);
+        }
+    };
+
     // positive values of b are left shifts, while negative values are (positive) rounding right shifts
     // only the lowest byte of each element is read as the shift amount
-    // conveniently, the behavior of bit shifts greater than element width is the same in NEON and SSE/AVX - filled with zeros
+    // conveniently, left shifts greater than element width are filled with zeros in both NEON and SSE/AVX
     const Xbyak::Xmm shift_amount = ctx.reg_alloc.ScratchXmm();
     code.vpabsb(shift_amount, b);
     code.vpand(shift_amount, shift_amount, code.BConst<esize>(xword, 0xFF));
 
     // if b is positive, do a normal left shift
     const Xbyak::Xmm left_shift = ctx.reg_alloc.ScratchXmm();
-    ICODE(vpsllv)(left_shift, a, shift_amount);
+    WDQCODE(vpsllv)(left_shift, a, shift_amount);
 
     // if b is negative, compute the rounding right shift
     // ARM documentation describes it as:
@@ -3848,23 +3912,27 @@ static void EmitUnsignedRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, I
     // tmp = (a >> (b - 1)) & 1
     // res = (a >> b) + tmp
     // to add the value of the last bit to be shifted off to the result of the right shift
+    // when shifting right by the element width or more, this gives zero for both signed and unsigned elements
     const Xbyak::Xmm right_shift = ctx.reg_alloc.ScratchXmm();
     code.vmovdqa(xmm0, code.BConst<esize>(xword, 1));
 
     // find value of last bit to be shifted off
-    ICODE(vpsub)(right_shift, shift_amount, xmm0);
-    ICODE(vpsrlv)(right_shift, a, right_shift);
+    WDQCODE(vpsub)(right_shift, shift_amount, xmm0);
+    shift_right(right_shift, a, right_shift);
     code.vpand(right_shift, right_shift, xmm0);
     // compute standard right shift
-    ICODE(vpsrlv)(xmm0, a, shift_amount);
+    shift_right(xmm0, a, shift_amount);
     // combine results
-    ICODE(vpadd)(right_shift, xmm0, right_shift);
+    WDQCODE(vpadd)(right_shift, xmm0, right_shift);
 
     // blend based on the sign bit of the lowest byte of each element of b
     // using the sse forms of pblendv over avx because they have considerably better latency & throughput on intel processors
     // note that this uses xmm0 as an implicit argument
-    ICODE(vpsll)(xmm0, b, u8(esize - 8));
-    if constexpr (esize == 32) {
+    WDQCODE(vpsll)(xmm0, b, u8(esize - 8));
+    if constexpr (esize == 16) {
+        code.vpsraw(xmm0, xmm0, 15);
+        code.pblendvb(left_shift, right_shift);
+    } else if constexpr (esize == 32) {
         code.blendvps(left_shift, right_shift);
     } else {
         code.blendvpd(left_shift, right_shift);
@@ -3874,37 +3942,112 @@ static void EmitUnsignedRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, I
     return;
 }
 
+// 8-bit elements are widened to 16 bits. Truncating the results back gives the same results as shifting 8-bit elements.
+template<bool is_signed>
+static void EmitRoundingShiftLeft8AVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+
+    const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm b = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+
+    const Xbyak::Ymm wide_a = ymm16;
+    const Xbyak::Ymm shift_amount = ymm17;
+    const Xbyak::Ymm left_shift = ymm18;
+    const Xbyak::Ymm right_shift = ymm19;
+    const Xbyak::Ymm one = ymm20;
+
+    if constexpr (is_signed) {
+        code.vpmovsxbw(wide_a, a);
+    } else {
+        code.vpmovzxbw(wide_a, a);
+    }
+    code.vpmovsxbw(shift_amount, b);
+    code.vpmovw2m(k1, shift_amount);
+    code.vpabsw(shift_amount, shift_amount);
+
+    code.vpsllvw(left_shift, wide_a, shift_amount);
+
+    code.vpternlogd(one, one, one, 0xFF);
+    code.vpsrlw(one, one, 15);
+    code.vpsubw(right_shift, shift_amount, one);
+    if constexpr (is_signed) {
+        code.vpsravw(right_shift, wide_a, right_shift);
+        code.vpsravw(wide_a, wide_a, shift_amount);
+    } else {
+        code.vpsrlvw(right_shift, wide_a, right_shift);
+        code.vpsrlvw(wide_a, wide_a, shift_amount);
+    }
+    code.vpandd(right_shift, right_shift, one);
+    code.vpaddw(right_shift, right_shift, wide_a);
+
+    code.vpblendmw(left_shift | k1, left_shift, right_shift);
+    code.vpmovwb(result, left_shift);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorRoundingShiftLeftS8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitRoundingShiftLeft8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s8>& result, const VectorArray<s8>& lhs, const VectorArray<s8>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftS16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitRoundingShiftLeft<16, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s16>& result, const VectorArray<s16>& lhs, const VectorArray<s16>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftS32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitRoundingShiftLeft<32, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s32>& result, const VectorArray<s32>& lhs, const VectorArray<s32>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftS64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitRoundingShiftLeft<64, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s64>& result, const VectorArray<s64>& lhs, const VectorArray<s64>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftU8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitRoundingShiftLeft8AVX512<false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u8>& lhs, const VectorArray<s8>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftU16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitRoundingShiftLeft<16, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u16>& result, const VectorArray<u16>& lhs, const VectorArray<s16>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
@@ -3912,7 +4055,7 @@ void EmitX64::EmitVectorRoundingShiftLeftU16(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitVectorRoundingShiftLeftU32(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX2)) {
-        EmitUnsignedRoundingShiftLeft<32>(code, ctx, inst);
+        EmitRoundingShiftLeft<32, false>(code, ctx, inst);
         return;
     }
 
@@ -3923,7 +4066,7 @@ void EmitX64::EmitVectorRoundingShiftLeftU32(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitVectorRoundingShiftLeftU64(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX2)) {
-        EmitUnsignedRoundingShiftLeft<64>(code, ctx, inst);
+        EmitRoundingShiftLeft<64, false>(code, ctx, inst);
         return;
     }
 
@@ -4992,19 +5135,146 @@ static bool VectorSignedSaturatedShiftLeft(VectorArray<T>& dst, const VectorArra
 #    pragma clang diagnostic pop
 #endif
 
+// Saturating shift left by the signed lowest byte of each element of the second operand.
+// Negative shift amounts are (non-saturating) right shifts.
+template<size_t esize, bool is_signed>
+static void EmitVectorSaturatedShiftLeftAVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(esize == 16 || esize == 32 || esize == 64);
+
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm shift = ctx.reg_alloc.UseScratchXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    const auto shift_right = [&](const Xbyak::Xmm& dst, const Xbyak::Xmm& src, const Xbyak::Xmm& amount) {
+        if constexpr (is_signed) {
+            WDQCODE(vpsrav)(dst, src, amount);
+        } else {
+            WDQCODE(vpsrlv)(dst, src, amount);
+        }
+    };
+
+    WDQCODE(vpsll)(shift, shift, u8(esize - 8));
+    WDQCODE(vpsra)(shift, shift, u8(esize - 8));
+
+    const Xbyak::Opmask negative_shift = k1;
+    const Xbyak::Opmask overflow = k2;
+    code.vpxor(xmm0, xmm0, xmm0);
+    WDQCODE(vpcmp)(negative_shift, shift, xmm0, CmpInt::LessThan);
+    code.knotw(k3, negative_shift);
+
+    // A left shift overflows if shifting back does not give the original element.
+    // Shifting by esize or more gives zero, which only gives back zero.
+    WDQCODE(vpsllv)(result, data, shift);
+    shift_right(tmp, result, shift);
+    WDQCODE(vpcmp)(overflow | k3, tmp, data, CmpInt::NotEqual);
+
+    if constexpr (is_signed) {
+        WDQCODE(vpsra)(tmp, data, u8(esize - 1));
+        code.vpxor(tmp, tmp, code.BConst<esize>(xword, mcl::bit::ones<u64>(esize - 1)));
+    } else {
+        code.vpcmpeqd(tmp, tmp, tmp);
+    }
+    WDQCODE(vpblendm)(result | overflow, result, tmp);
+
+    // Shifting right by esize or more gives the same result as shifting by esize - 1 (signed) or zero (unsigned)
+    WDQCODE(vpsub)(shift, xmm0, shift);
+    shift_right(tmp, data, shift);
+    WDQCODE(vpblendm)(result | negative_shift, result, tmp);
+
+    code.kmovw(bit, overflow);
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
+// 8-bit elements are widened to 16 bits, where shifting left by up to 8 cannot overflow, and saturated when narrowing back.
+template<bool is_signed>
+static void EmitVectorSaturatedShiftLeft8AVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm shift = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    const Xbyak::Ymm wide_data = ymm16;
+    const Xbyak::Ymm wide_shift = ymm17;
+    const Xbyak::Ymm left = ymm18;
+    const Xbyak::Ymm tmp = ymm19;
+
+    if constexpr (is_signed) {
+        code.vpmovsxbw(wide_data, data);
+    } else {
+        code.vpmovzxbw(wide_data, data);
+    }
+    code.vpmovsxbw(wide_shift, shift);
+    code.vpmovw2m(k1, wide_shift);
+
+    // Any non-zero element saturates when shifted left by 8 or more
+    code.vpternlogd(tmp, tmp, tmp, 0xFF);
+    code.vpsrlw(tmp, tmp, 15);
+    code.vpsllw(tmp, tmp, 3);
+    code.vpminsw(left, wide_shift, tmp);
+    code.vpsllvw(left, wide_data, left);
+
+    code.vpxord(tmp, tmp, tmp);
+    code.vpsubw(wide_shift, tmp, wide_shift);
+    if constexpr (is_signed) {
+        code.vpsravw(tmp, wide_data, wide_shift);
+    } else {
+        code.vpsrlvw(tmp, wide_data, wide_shift);
+    }
+    code.vpblendmw(left | k1, left, tmp);
+
+    if constexpr (is_signed) {
+        code.vpmovswb(result, left);
+        code.vpmovsxbw(tmp, result);
+    } else {
+        code.vpmovuswb(result, left);
+        code.vpmovzxbw(tmp, result);
+    }
+    code.vpcmpw(k2, tmp, left, CmpInt::NotEqual);
+    code.kmovw(bit, k2);
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorSignedSaturatedShiftLeft8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSaturatedShiftLeft8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s8>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeft16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSaturatedShiftLeftAVX512<16, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s16>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeft32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSaturatedShiftLeftAVX512<32, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s32>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeft64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSaturatedShiftLeftAVX512<64, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s64>);
 }
 
@@ -5038,19 +5308,81 @@ static bool VectorSignedSaturatedShiftLeftUnsigned(VectorArray<T>& dst, const Ve
     return qc_flag;
 }
 
+template<size_t esize>
+static void EmitVectorSignedSaturatedShiftLeftUnsignedAVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const u8 shift_amount = args[1].GetImmediateU8();
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm ones = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    // Negative elements saturate to zero. Others saturate to the maximum if set bits get shifted out.
+    const Xbyak::Opmask negative = k1;
+    const Xbyak::Opmask overflow = k2;
+    const Xbyak::Address overflow_limit = code.BConst<esize>(xword, mcl::bit::ones<u64>(esize) >> shift_amount);
+    code.vpxor(xmm0, xmm0, xmm0);
+    code.vpcmpeqd(ones, ones, ones);
+
+    if constexpr (esize == 8) {
+        code.vpcmpb(negative, data, xmm0, CmpInt::LessThan);
+        code.vpcmpub(overflow, data, overflow_limit, CmpInt::GreaterThan);
+
+        code.vpsllw(result, data, shift_amount);
+        code.vpand(result, result, code.BConst<8>(xword, u8(0xFF << shift_amount)));
+
+        code.vpblendmb(result | overflow, result, ones);
+        code.vpblendmb(result | negative, result, xmm0);
+    } else {
+        WDQCODE(vpcmp)(negative, data, xmm0, CmpInt::LessThan);
+        WDQCODE(vpcmpu)(overflow, data, overflow_limit, CmpInt::GreaterThan);
+
+        WDQCODE(vpsll)(result, data, shift_amount);
+
+        WDQCODE(vpblendm)(result | overflow, result, ones);
+        WDQCODE(vpblendm)(result | negative, result, xmm0);
+    }
+
+    code.korw(k3, negative, overflow);
+    code.kmovw(bit, k3);
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<8>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s8>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<16>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s16>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<32>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s32>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<64>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s64>);
 }
 
@@ -6080,18 +6412,38 @@ static bool VectorUnsignedSaturatedShiftLeft(VectorArray<T>& dst, const VectorAr
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft8(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSaturatedShiftLeft8AVX512<false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u8>);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorSaturatedShiftLeftAVX512<16, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u16>);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSaturatedShiftLeftAVX512<32, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u32>);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorSaturatedShiftLeftAVX512<64, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u64>);
 }
 

@@ -97,6 +97,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     for (auto iter = block.begin(); iter != block.end(); ++iter) {
         IR::Inst* inst = &*iter;
 
+        if (!CanEmitWithStandardASIMDMXCSR(*inst)) {
+            SwitchToGuestMXCSR(code, ctx);
+        }
+
         // Call the relevant Emit* member function.
         switch (inst->GetOpcode()) {
 #define OPCODE(name, type, ...)            \
@@ -126,6 +130,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     }
 
     reg_alloc.AssertNoMoreUses();
+
+    SwitchToGuestMXCSR(code, ctx);
 
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());

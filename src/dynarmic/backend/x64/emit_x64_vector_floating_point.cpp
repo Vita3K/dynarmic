@@ -62,12 +62,12 @@ void MaybeStandardFPSCRValue(BlockOfCode& code, EmitContext& ctx, bool fpcr_cont
     const bool switch_mxcsr = ctx.FPCR(fpcr_controlled) != ctx.FPCR();
 
     if (switch_mxcsr && !ctx.HasOptimization(OptimizationFlag::Unsafe_IgnoreStandardFPCRValue)) {
-        code.EnterStandardASIMD();
-        lambda();
-        code.LeaveStandardASIMD();
+        // Stays loaded for following instructions that can use it, see CanEmitWithStandardASIMDMXCSR.
+        SwitchToStandardASIMDMXCSR(code, ctx);
     } else {
-        lambda();
+        SwitchToGuestMXCSR(code, ctx);
     }
+    lambda();
 }
 
 template<size_t fsize, template<typename> class Indexer, size_t narg>

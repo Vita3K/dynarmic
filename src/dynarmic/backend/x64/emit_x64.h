@@ -63,7 +63,21 @@ struct EmitContext {
     IR::Block& block;
 
     std::vector<std::function<void()>> deferred_emits;
+
+    /// Whether the standard ASIMD MXCSR is currently loaded in place of the guest MXCSR.
+    bool standard_asimd_mxcsr = false;
 };
+
+/// Loads the standard ASIMD MXCSR unless it is already loaded. It stays loaded across subsequent instructions until
+/// SwitchToGuestMXCSR is called, so consecutive instructions that use the standard FPSCR value only switch once.
+void SwitchToStandardASIMDMXCSR(BlockOfCode& code, EmitContext& ctx);
+
+/// Reloads the guest MXCSR if the standard ASIMD MXCSR is loaded.
+void SwitchToGuestMXCSR(BlockOfCode& code, EmitContext& ctx);
+
+/// Whether inst may be emitted while the standard ASIMD MXCSR is loaded.
+/// The guest MXCSR must be restored before any other instruction and before the block terminal.
+bool CanEmitWithStandardASIMDMXCSR(const IR::Inst& inst);
 
 using SharedLabel = std::shared_ptr<Xbyak::Label>;
 

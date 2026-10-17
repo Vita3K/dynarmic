@@ -40,6 +40,72 @@ void EmitContext::EraseInstruction(IR::Inst* inst) {
     inst->ClearArgs();
 }
 
+void SwitchToStandardASIMDMXCSR(BlockOfCode& code, EmitContext& ctx) {
+    if (!ctx.standard_asimd_mxcsr) {
+        code.EnterStandardASIMD();
+        ctx.standard_asimd_mxcsr = true;
+    }
+}
+
+void SwitchToGuestMXCSR(BlockOfCode& code, EmitContext& ctx) {
+    if (ctx.standard_asimd_mxcsr) {
+        code.LeaveStandardASIMD();
+        ctx.standard_asimd_mxcsr = false;
+    }
+}
+
+bool CanEmitWithStandardASIMDMXCSR(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    // These neither depend on MXCSR nor call into host code.
+    case IR::Opcode::A32GetExtendedRegister32:
+    case IR::Opcode::A32GetExtendedRegister64:
+    case IR::Opcode::A32GetVector:
+    case IR::Opcode::A32SetExtendedRegister32:
+    case IR::Opcode::A32SetExtendedRegister64:
+    case IR::Opcode::A32SetVector:
+    case IR::Opcode::VectorAnd:
+    case IR::Opcode::VectorAndNot:
+    case IR::Opcode::VectorBroadcast32:
+    case IR::Opcode::VectorBroadcastElement32:
+    case IR::Opcode::VectorBroadcastElementLower32:
+    case IR::Opcode::VectorBroadcastLower32:
+    case IR::Opcode::VectorEor:
+    case IR::Opcode::VectorExtract:
+    case IR::Opcode::VectorExtractLower:
+    case IR::Opcode::VectorGetElement32:
+    case IR::Opcode::VectorNot:
+    case IR::Opcode::VectorOr:
+    case IR::Opcode::VectorSetElement32:
+    case IR::Opcode::VectorZeroUpper:
+    case IR::Opcode::FPVectorAbs32:
+    case IR::Opcode::FPVectorNeg32:
+        return true;
+    // These select the MXCSR they need via MaybeStandardFPSCRValue. Their last argument is fpcr_controlled.
+    case IR::Opcode::FPVectorAdd32:
+    case IR::Opcode::FPVectorEqual32:
+    case IR::Opcode::FPVectorFromSignedFixed32:
+    case IR::Opcode::FPVectorFromUnsignedFixed32:
+    case IR::Opcode::FPVectorGreater32:
+    case IR::Opcode::FPVectorGreaterEqual32:
+    case IR::Opcode::FPVectorMax32:
+    case IR::Opcode::FPVectorMin32:
+    case IR::Opcode::FPVectorMul32:
+    case IR::Opcode::FPVectorMulAdd32:
+    case IR::Opcode::FPVectorPairedAdd32:
+    case IR::Opcode::FPVectorPairedAddLower32:
+    case IR::Opcode::FPVectorRecipEstimate32:
+    case IR::Opcode::FPVectorRecipStepFused32:
+    case IR::Opcode::FPVectorRSqrtEstimate32:
+    case IR::Opcode::FPVectorRSqrtStepFused32:
+    case IR::Opcode::FPVectorSub32:
+    case IR::Opcode::FPVectorToSignedFixed32:
+    case IR::Opcode::FPVectorToUnsignedFixed32:
+        return !inst.GetArg(inst.NumArgs() - 1).GetU1();
+    default:
+        return false;
+    }
+}
+
 EmitX64::EmitX64(BlockOfCode& code)
         : code(code) {
     exception_handler.Register(code);

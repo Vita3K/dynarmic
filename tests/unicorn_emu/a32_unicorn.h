@@ -73,6 +73,8 @@ private:
     static bool UnmappedMemoryHook(uc_engine* uc, uc_mem_type type, u32 addr, int size, u64 value, void* user_data);
     static bool MemoryWriteHook(uc_engine* uc, uc_mem_type type, u32 addr, int size, u64 value, void* user_data);
 
+    void MapPage(u32 base_address);
+
     struct Page {
         u32 address;
         std::array<u8, 4096> data;

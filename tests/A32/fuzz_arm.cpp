@@ -114,6 +114,14 @@ bool ShouldTestInst(u32 instruction, u32 pc, bool is_thumb, bool is_last_inst, A
     return true;
 }
 
+// QEMU decodes YIELD, WFE and WFI from the immediate alone and ignores the rotation field. So the otherwise reserved
+// MSR (immediate) encodings with an empty mask (the hint space) that look like those hints stop Unicorn 2 with
+// UC_ERR_INSN_INVALID, while we treat them as NOPs.
+bool IsHintDecodedAsWait(u32 instruction) {
+    const u32 hint = instruction & 0xFF;
+    return (instruction & 0x0FFFF000) == 0x0320F000 && hint >= 1 && hint <= 3;
+}
+
 u32 GenRandomArmInst(u32 pc, bool is_last_inst) {
     static const struct InstructionGeneratorInfo {
         std::vector<InstructionGenerator> generators;
@@ -176,6 +184,10 @@ u32 GenRandomArmInst(u32 pc, bool is_last_inst) {
         const u32 inst = instructions.generators[index].Generate();
 
         if ((instructions.generators[index].Mask() & 0xF0000000) == 0 && (inst & 0xF0000000) == 0xF0000000) {
+            continue;
+        }
+
+        if (IsHintDecodedAsWait(inst)) {
             continue;
         }
 

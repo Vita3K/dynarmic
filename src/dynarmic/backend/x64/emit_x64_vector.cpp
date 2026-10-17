@@ -4723,6 +4723,24 @@ void EmitX64::EmitVectorSignedSaturatedNarrowToSigned32(EmitContext& ctx, IR::In
 }
 
 void EmitX64::EmitVectorSignedSaturatedNarrowToSigned64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        code.vpmovsqd(dest, src);
+
+        // Saturation happened where the result does not extend back to the source
+        code.vpmovsxdq(xmm0, dest);
+        code.vpcmpq(k1, xmm0, src, CmpInt::NotEqual);
+        code.kmovw(bit, k1);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<s32>& result, const VectorArray<s64>& a) {
         result = {};
         bool qc_flag = false;
@@ -4792,6 +4810,26 @@ void EmitX64::EmitVectorSignedSaturatedNarrowToUnsigned32(EmitContext& ctx, IR::
 }
 
 void EmitX64::EmitVectorSignedSaturatedNarrowToUnsigned64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        code.vpxor(xmm0, xmm0, xmm0);
+        code.vpmaxsq(dest, src, xmm0);
+        code.vpmovusqd(dest, dest);
+
+        // Saturation happened where the result does not extend back to the source
+        code.vpmovzxdq(xmm0, dest);
+        code.vpcmpq(k1, xmm0, src, CmpInt::NotEqual);
+        code.kmovw(bit, k1);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u32>& result, const VectorArray<s64>& a) {
         result = {};
         bool qc_flag = false;
@@ -5881,7 +5919,77 @@ void EmitX64::EmitVectorUnsignedSaturatedAccumulateSigned64(EmitContext& ctx, IR
     });
 }
 
+template<size_t original_esize>
+static void EmitVectorUnsignedSaturatedNarrowAVX512(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    // Elements with any bit set in their upper half saturate
+    constexpr u64 upper_half = mcl::bit::ones<u64>(original_esize / 2) << (original_esize / 2);
+    if constexpr (original_esize == 16) {
+        code.vpmovuswb(dest, src);
+        code.vptestmw(k1, src, code.BConst<16>(xword, upper_half));
+    } else if constexpr (original_esize == 32) {
+        code.vpmovusdw(dest, src);
+        code.vptestmd(k1, src, code.BConst<32>(xword, upper_half));
+    } else {
+        code.vpmovusqd(dest, src);
+        code.vptestmq(k1, src, code.BConst<64>(xword, upper_half));
+    }
+    code.kmovw(bit, k1);
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(inst, dest);
+}
+
+template<size_t original_esize>
+static void EmitVectorUnsignedSaturatedNarrowSSE41(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(original_esize == 16 || original_esize == 32);
+
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    code.movdqa(dest, src);
+    if constexpr (original_esize == 16) {
+        code.pminuw(dest, code.BConst<16>(xword, 0xFF));
+        code.movdqa(xmm0, dest);
+        code.pcmpeqw(xmm0, src);
+    } else {
+        code.pminud(dest, code.BConst<32>(xword, 0xFFFF));
+        code.movdqa(xmm0, dest);
+        code.pcmpeqd(xmm0, src);
+    }
+
+    // Saturation happened where clamping changed the element
+    code.pmovmskb(bit, xmm0);
+    code.xor_(bit, 0xFFFF);
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    code.pxor(xmm0, xmm0);
+    if constexpr (original_esize == 16) {
+        code.packuswb(dest, xmm0);
+    } else {
+        code.packusdw(dest, xmm0);
+    }
+
+    ctx.reg_alloc.DefineValue(inst, dest);
+}
+
 void EmitX64::EmitVectorUnsignedSaturatedNarrow16(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
+        EmitVectorUnsignedSaturatedNarrowAVX512<16>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::SSE41)) {
+        EmitVectorUnsignedSaturatedNarrowSSE41<16>(code, ctx, inst);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u16>& a) {
         result = {};
         bool qc_flag = false;
@@ -5895,6 +6003,16 @@ void EmitX64::EmitVectorUnsignedSaturatedNarrow16(EmitContext& ctx, IR::Inst* in
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedNarrow32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorUnsignedSaturatedNarrowAVX512<32>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::SSE41)) {
+        EmitVectorUnsignedSaturatedNarrowSSE41<32>(code, ctx, inst);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u16>& result, const VectorArray<u32>& a) {
         result = {};
         bool qc_flag = false;
@@ -5908,6 +6026,11 @@ void EmitX64::EmitVectorUnsignedSaturatedNarrow32(EmitContext& ctx, IR::Inst* in
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedNarrow64(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
+        EmitVectorUnsignedSaturatedNarrowAVX512<64>(code, ctx, inst);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u32>& result, const VectorArray<u64>& a) {
         result = {};
         bool qc_flag = false;

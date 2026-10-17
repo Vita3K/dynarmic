@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <bitset>
 #include <cstdlib>
@@ -637,9 +638,92 @@ static void EmitVectorVShift8AVX512(BlockOfCode& code, EmitContext& ctx, IR::Ins
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
+// AVX2 has no variable shifts of 8-bit and 16-bit elements, so these are shifted in the upper bits of 32-bit elements,
+// where a left shift by n (up to 32 - esize) is a right shift by 32 - esize - n.
+// The lowest byte of each element of amount gives its right shift amount. Returns the 32-bit results in element order.
+template<size_t esize, bool is_signed>
+static std::array<Xbyak::Xmm, 32 / esize> EmitWidenedShiftRightAVX2(BlockOfCode& code, EmitContext& ctx, const Xbyak::Xmm& data, const Xbyak::Xmm& amount) {
+    static_assert(esize == 8 || esize == 16);
+    constexpr size_t element_bytes = esize / 8;
+
+    std::array<Xbyak::Xmm, 32 / esize> result;
+    for (size_t i = 0; i < result.size(); i++) {
+        // Byte indices that move element 4 * i + j to the upper bits of 32-bit element j,
+        // and its lowest byte to the lowest byte of 32-bit element j. Index 0x80 gives a zero byte.
+        std::array<u64, 2> data_indices{};
+        std::array<u64, 2> amount_indices{};
+        for (size_t j = 0; j < 4; j++) {
+            const u64 first_byte = (4 * i + j) * element_bytes;
+            u64 data_index = 0;
+            for (size_t k = 0; k < 4; k++) {
+                const u64 index = k < 4 - element_bytes ? 0x80 : first_byte + k - (4 - element_bytes);
+                data_index |= index << (8 * k);
+            }
+            data_indices[j / 2] |= data_index << (32 * (j % 2));
+            amount_indices[j / 2] |= (0x80808000 | first_byte) << (32 * (j % 2));
+        }
+
+        result[i] = ctx.reg_alloc.ScratchXmm();
+        code.vpshufb(result[i], data, code.Const(xword, data_indices[0], data_indices[1]));
+        code.vpshufb(xmm0, amount, code.Const(xword, amount_indices[0], amount_indices[1]));
+        if constexpr (is_signed) {
+            code.vpsravd(result[i], result[i], xmm0);
+        } else {
+            code.vpsrlvd(result[i], result[i], xmm0);
+        }
+    }
+    return result;
+}
+
+// Truncates the results of EmitWidenedShiftRightAVX2 to esize bits. 8-bit results must fit in 16 bits.
+template<size_t esize, bool is_signed>
+static void EmitWidenedTruncateAVX2(BlockOfCode& code, const Xbyak::Xmm& result, const std::array<Xbyak::Xmm, 32 / esize>& wide) {
+    if constexpr (esize == 8) {
+        if constexpr (is_signed) {
+            code.vpackssdw(wide[0], wide[0], wide[1]);
+            code.vpackssdw(wide[1], wide[2], wide[3]);
+        } else {
+            code.vpackusdw(wide[0], wide[0], wide[1]);
+            code.vpackusdw(wide[1], wide[2], wide[3]);
+        }
+        code.vpand(wide[0], wide[0], code.BConst<16>(xword, 0xFF));
+        code.vpand(wide[1], wide[1], code.BConst<16>(xword, 0xFF));
+        code.vpackuswb(result, wide[0], wide[1]);
+    } else {
+        code.vpand(wide[0], wide[0], code.BConst<32>(xword, 0xFFFF));
+        code.vpand(wide[1], wide[1], code.BConst<32>(xword, 0xFFFF));
+        code.vpackusdw(result, wide[0], wide[1]);
+    }
+}
+
+template<size_t esize, bool is_signed>
+static void EmitVectorVShiftWidenedAVX2(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm b = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+
+    // Shift right by 32 - esize - b. Left shifts by esize or more give zero in the lowest esize bits,
+    // so b is limited to esize, which also keeps 8-bit results within 16 bits.
+    // Only the lowest byte of each element is used, so this is computed on bytes.
+    code.vpminsb(xmm0, b, code.BConst<8>(xword, esize));
+    code.vmovdqa(result, code.BConst<8>(xword, 32 - esize));
+    code.vpsubb(result, result, xmm0);
+
+    const auto wide = EmitWidenedShiftRightAVX2<esize, is_signed>(code, ctx, a, result);
+    EmitWidenedTruncateAVX2<esize, is_signed>(code, result, wide);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorArithmeticVShift8(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitVectorVShift8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorVShiftWidenedAVX2<8, true>(code, ctx, inst);
         return;
     }
 
@@ -675,6 +759,11 @@ void EmitX64::EmitVectorArithmeticVShift16(EmitContext& ctx, IR::Inst* inst) {
         code.vpblendmb(result | mask, result, tmp);
 
         ctx.reg_alloc.DefineValue(inst, result);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorVShiftWidenedAVX2<16, true>(code, ctx, inst);
         return;
     }
 
@@ -1992,6 +2081,11 @@ void EmitX64::EmitVectorLogicalVShift8(EmitContext& ctx, IR::Inst* inst) {
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorVShiftWidenedAVX2<8, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u8>& a, const VectorArray<u8>& b) {
         std::transform(a.begin(), a.end(), b.begin(), result.begin(), VShift<u8>);
     });
@@ -2017,6 +2111,11 @@ void EmitX64::EmitVectorLogicalVShift16(EmitContext& ctx, IR::Inst* inst) {
         code.vpord(result, result, tmp);
 
         ctx.reg_alloc.DefineValue(inst, result);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorVShiftWidenedAVX2<16, false>(code, ctx, inst);
         return;
     }
 
@@ -3987,9 +4086,45 @@ static void EmitRoundingShiftLeft8AVX512(BlockOfCode& code, EmitContext& ctx, IR
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
+// A rounding right shift by n is ((x >> (n - 1)) + 1) >> 1. Shifting in the upper bits of 32-bit elements,
+// this also gives left shifts, as shifting left by one more leaves the lowest bit clear.
+template<size_t esize, bool is_signed>
+static void EmitRoundingShiftLeftWidenedAVX2(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm b = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+
+    // Shift right by 32 - esize - b - 1. Left shifts by esize or more give zero in the lowest esize bits:
+    // b is limited to esize, which keeps 8-bit results within 16 bits, and for 16-bit elements
+    // the shift amount for b = 16 wraps around to 255, which gives zero as well.
+    // Only the lowest byte of each element is used, so this is computed on bytes.
+    code.vpminsb(xmm0, b, code.BConst<8>(xword, esize));
+    code.vmovdqa(result, code.BConst<8>(xword, 31 - esize));
+    code.vpsubb(result, result, xmm0);
+
+    const auto wide = EmitWidenedShiftRightAVX2<esize, is_signed>(code, ctx, a, result);
+    for (const auto& w : wide) {
+        code.vpaddd(w, w, code.BConst<32>(xword, 1));
+        if constexpr (is_signed) {
+            code.vpsrad(w, w, 1);
+        } else {
+            code.vpsrld(w, w, 1);
+        }
+    }
+    EmitWidenedTruncateAVX2<esize, is_signed>(code, result, wide);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorRoundingShiftLeftS8(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitRoundingShiftLeft8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitRoundingShiftLeftWidenedAVX2<8, true>(code, ctx, inst);
         return;
     }
 
@@ -4001,6 +4136,11 @@ void EmitX64::EmitVectorRoundingShiftLeftS8(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::EmitVectorRoundingShiftLeftS16(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitRoundingShiftLeft<16, true>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitRoundingShiftLeftWidenedAVX2<16, true>(code, ctx, inst);
         return;
     }
 
@@ -4037,6 +4177,11 @@ void EmitX64::EmitVectorRoundingShiftLeftU8(EmitContext& ctx, IR::Inst* inst) {
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitRoundingShiftLeftWidenedAVX2<8, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<u8>& result, const VectorArray<u8>& lhs, const VectorArray<s8>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });
@@ -4045,6 +4190,11 @@ void EmitX64::EmitVectorRoundingShiftLeftU8(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::EmitVectorRoundingShiftLeftU16(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitRoundingShiftLeft<16, false>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitRoundingShiftLeftWidenedAVX2<16, false>(code, ctx, inst);
         return;
     }
 
@@ -4884,6 +5034,34 @@ void EmitX64::EmitVectorSignedSaturatedNarrowToSigned64(EmitContext& ctx, IR::In
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::SSE41 | HostFeature::SSE42)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Xmm below = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        // Elements below INT32_MIN or above INT32_MAX saturate
+        code.movdqa(below, code.BConst<64>(xword, 0xFFFFFFFF80000000));
+        code.pcmpgtq(below, src);
+        code.movdqa(xmm0, src);
+        code.pcmpgtq(xmm0, code.BConst<64>(xword, 0x7FFFFFFF));
+        code.por(xmm0, below);
+        code.movmskpd(bit, xmm0);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        // The lower halves of the saturated values are INT32_MIN below INT32_MIN, and INT32_MAX otherwise
+        code.pxor(below, code.BConst<64>(xword, 0x7FFFFFFF));
+        code.movdqa(dest, src);
+        code.blendvpd(dest, below);
+
+        // Move the lower half of element 1 next to that of element 0, and zero the upper 64 bits
+        code.insertps(dest, dest, 0b10011100);
+
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<s32>& result, const VectorArray<s64>& a) {
         result = {};
         bool qc_flag = false;
@@ -4967,6 +5145,33 @@ void EmitX64::EmitVectorSignedSaturatedNarrowToUnsigned64(EmitContext& ctx, IR::
         code.vpmovzxdq(xmm0, dest);
         code.vpcmpq(k1, xmm0, src, CmpInt::NotEqual);
         code.kmovw(bit, k1);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::SSE41 | HostFeature::SSE42)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Xmm saturated = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        // Negative elements saturate to zero, and elements above UINT32_MAX to UINT32_MAX
+        code.pxor(dest, dest);
+        code.pcmpgtq(dest, src);
+        code.movdqa(saturated, src);
+        code.pcmpgtq(saturated, code.BConst<64>(xword, 0xFFFFFFFF));
+        code.movdqa(xmm0, src);
+        code.por(xmm0, saturated);
+        code.por(saturated, dest);
+        code.pandn(dest, xmm0);
+
+        // Move the lower half of element 1 next to that of element 0, and zero the upper 64 bits
+        code.insertps(dest, dest, 0b10011100);
+
+        code.movmskpd(bit, saturated);
         code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
 
         ctx.reg_alloc.DefineValue(inst, dest);
@@ -5242,9 +5447,159 @@ static void EmitVectorSaturatedShiftLeft8AVX512(BlockOfCode& code, EmitContext& 
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
+// Saturating shift left by the signed lowest byte of each element of the second operand.
+// Negative shift amounts are (non-saturating) right shifts.
+template<size_t esize, bool is_signed>
+static void EmitVectorSaturatedShiftLeftAVX2(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(esize == 32 || esize == 64);
+
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm shift = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm amount = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm left = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm valid = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+    // Shift by the magnitude of the shift amount. Shifting by esize or more gives zero, except for arithmetic
+    // right shifts, which give the same result as shifting by esize - 1.
+    code.vpabsb(amount, shift);
+    code.vpand(amount, amount, code.BConst<esize>(xword, 0xFF));
+
+    // A left shift overflows if shifting back does not give the original element.
+    // Shifting by esize or more gives zero, which only gives back zero.
+    ICODE(vpsllv)(left, data, amount);
+    if constexpr (esize == 64 && is_signed) {
+        // AVX2 has no arithmetic right shift of 64-bit elements. With sign = x < 0 ? -1 : 0, x >> n is ((x ^ sign) >> n) ^ sign.
+        code.vpxor(xmm0, xmm0, xmm0);
+        code.vpcmpgtq(result, xmm0, data);
+        code.vpcmpgtq(valid, xmm0, left);
+        code.vpxor(xmm0, left, valid);
+        code.vpsrlvq(xmm0, xmm0, amount);
+        code.vpxor(valid, xmm0, valid);
+        code.vpcmpeqq(valid, valid, data);
+
+        code.vpxor(xmm0, data, result);
+        code.vpsrlvq(xmm0, xmm0, amount);
+        code.vpxor(amount, xmm0, result);
+    } else {
+        if constexpr (is_signed) {
+            code.vpsravd(valid, left, amount);
+            code.vpsravd(amount, data, amount);
+        } else {
+            ICODE(vpsrlv)(valid, left, amount);
+            ICODE(vpsrlv)(amount, data, amount);
+        }
+        ICODE(vpcmpeq)(valid, valid, data);
+    }
+
+    // Select the right shift for negative shift amounts, which never saturate.
+    // The blends use the sign bit of each element of xmm0.
+    ICODE(vpsll)(xmm0, shift, u8(esize - 8));
+    code.vpor(valid, valid, xmm0);
+    if constexpr (esize == 32) {
+        code.blendvps(left, amount);
+        code.vmovmskps(bit, valid);
+        code.xor_(bit, 0b1111);
+    } else {
+        code.blendvpd(left, amount);
+        code.vmovmskpd(bit, valid);
+        code.xor_(bit, 0b11);
+    }
+    code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    if constexpr (is_signed) {
+        // INT_MAX for non-negative elements and INT_MIN for negative elements.
+        // For 64-bit elements, result already holds the sign of each element.
+        if constexpr (esize == 32) {
+            code.vpsrad(result, data, 31);
+        }
+        code.vpxor(result, result, code.BConst<esize>(xword, mcl::bit::ones<u64>(esize - 1)));
+    } else {
+        code.vpcmpeqd(result, result, result);
+    }
+    code.vmovaps(xmm0, valid);
+    if constexpr (esize == 32) {
+        code.blendvps(result, left);
+    } else {
+        code.blendvpd(result, left);
+    }
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
+// 8-bit and 16-bit elements are shifted in the upper bits of 32-bit elements, where shifting left by up to esize
+// gives the exact result, and any non-zero element saturates when shifted left by esize. Narrowing back saturates.
+template<size_t esize, bool is_signed>
+static void EmitVectorSaturatedShiftLeftWidenedAVX2(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    static_assert(esize == 8 || esize == 16);
+
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const Xbyak::Xmm shift = ctx.reg_alloc.UseXmm(args[1]);
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Reg8 bit = ctx.reg_alloc.ScratchGpr().cvt8();
+
+    // Shift right by 32 - esize - shift, with shift limited to esize.
+    // Only the lowest byte of each element is used, so this is computed on bytes.
+    code.vpminsb(xmm0, shift, code.BConst<8>(xword, esize));
+    code.vmovdqa(result, code.BConst<8>(xword, 32 - esize));
+    code.vpsubb(result, result, xmm0);
+    auto wide = EmitWidenedShiftRightAVX2<esize, is_signed>(code, ctx, data, result);
+
+    // 8-bit results fit in 16 bits, so narrow them to 16 bits first
+    if constexpr (esize == 8) {
+        if constexpr (is_signed) {
+            code.vpackssdw(wide[0], wide[0], wide[1]);
+            code.vpackssdw(wide[1], wide[2], wide[3]);
+        } else {
+            code.vpackusdw(wide[0], wide[0], wide[1]);
+            code.vpackusdw(wide[1], wide[2], wide[3]);
+        }
+    }
+
+    // Saturation happened where a result does not fit in esize bits
+    constexpr u64 upper_bits = mcl::bit::ones<u64>(esize) << esize;
+    if constexpr (is_signed) {
+        if constexpr (esize == 8) {
+            code.vpacksswb(result, wide[0], wide[1]);
+            code.vpaddw(wide[0], wide[0], code.BConst<16>(xword, 0x80));
+            code.vpaddw(wide[1], wide[1], code.BConst<16>(xword, 0x80));
+        } else {
+            code.vpackssdw(result, wide[0], wide[1]);
+            code.vpaddd(wide[0], wide[0], code.BConst<32>(xword, 0x8000));
+            code.vpaddd(wide[1], wide[1], code.BConst<32>(xword, 0x8000));
+        }
+        code.vpor(xmm0, wide[0], wide[1]);
+        code.vptest(xmm0, code.BConst<2 * esize>(xword, upper_bits));
+    } else {
+        code.vpor(xmm0, wide[0], wide[1]);
+        code.vptest(xmm0, code.BConst<2 * esize>(xword, upper_bits));
+        if constexpr (esize == 8) {
+            code.vpminuw(wide[0], wide[0], code.BConst<16>(xword, 0xFF));
+            code.vpminuw(wide[1], wide[1], code.BConst<16>(xword, 0xFF));
+            code.vpackuswb(result, wide[0], wide[1]);
+        } else {
+            code.vpminud(wide[0], wide[0], code.BConst<32>(xword, 0xFFFF));
+            code.vpminud(wide[1], wide[1], code.BConst<32>(xword, 0xFFFF));
+            code.vpackusdw(result, wide[0], wide[1]);
+        }
+    }
+    code.setnz(bit);
+    code.or_(code.byte[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorSignedSaturatedShiftLeft8(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitVectorSaturatedShiftLeft8AVX512<true>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftWidenedAVX2<8, true>(code, ctx, inst);
         return;
     }
 
@@ -5257,6 +5612,11 @@ void EmitX64::EmitVectorSignedSaturatedShiftLeft16(EmitContext& ctx, IR::Inst* i
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftWidenedAVX2<16, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s16>);
 }
 
@@ -5266,12 +5626,22 @@ void EmitX64::EmitVectorSignedSaturatedShiftLeft32(EmitContext& ctx, IR::Inst* i
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftAVX2<32, true>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorSignedSaturatedShiftLeft<s32>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeft64(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
         EmitVectorSaturatedShiftLeftAVX512<64, true>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftAVX2<64, true>(code, ctx, inst);
         return;
     }
 
@@ -5350,9 +5720,77 @@ static void EmitVectorSignedSaturatedShiftLeftUnsignedAVX512(BlockOfCode& code, 
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
+template<size_t esize>
+static void EmitVectorSignedSaturatedShiftLeftUnsignedAVX(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+    const u8 shift_amount = args[1].GetImmediateU8();
+    const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+    const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
+
+    if constexpr (esize == 8 || esize == 16) {
+        const Xbyak::Reg8 bit = ctx.reg_alloc.ScratchGpr().cvt8();
+
+        // Shifting (element << esize) | element right by esize - shift_amount gives element << shift_amount, plus the
+        // upper bits of the lower copy, which are only non-zero if the result saturates anyway.
+        // Narrowing then saturates negative elements to zero, and others to the maximum.
+        if constexpr (esize == 8) {
+            code.vpunpcklbw(result, data, data);
+            code.vpunpckhbw(tmp, data, data);
+            code.vpsraw(result, result, u8(8 - shift_amount));
+            code.vpsraw(tmp, tmp, u8(8 - shift_amount));
+        } else {
+            code.vpunpcklwd(result, data, data);
+            code.vpunpckhwd(tmp, data, data);
+            code.vpsrad(result, result, u8(16 - shift_amount));
+            code.vpsrad(tmp, tmp, u8(16 - shift_amount));
+        }
+
+        // Saturation happened where a result does not fit in esize bits
+        code.vpor(xmm0, result, tmp);
+        code.vptest(xmm0, code.BConst<2 * esize>(xword, mcl::bit::ones<u64>(esize) << esize));
+        code.setnz(bit);
+        code.or_(code.byte[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        if constexpr (esize == 8) {
+            code.vpackuswb(result, result, tmp);
+        } else {
+            code.vpackusdw(result, result, tmp);
+        }
+    } else {
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        // Negative elements saturate to zero. Others saturate to the maximum if set bits get shifted out,
+        // which is when they are above the maximum shifted right. That limit is positive, so negative elements are below it.
+        code.vpxor(xmm0, xmm0, xmm0);
+        ICODE(vpcmpgt)(tmp, xmm0, data);
+        ICODE(vpsll)(result, data, shift_amount);
+        if (shift_amount != 0) {
+            ICODE(vpcmpgt)(xmm0, data, code.BConst<esize>(xword, mcl::bit::ones<u64>(esize) >> shift_amount));
+            code.vpor(result, result, xmm0);
+        }
+        code.vpandn(result, tmp, result);
+
+        code.vpor(xmm0, xmm0, tmp);
+        if constexpr (esize == 32) {
+            code.vmovmskps(bit, xmm0);
+        } else {
+            code.vmovmskpd(bit, xmm0);
+        }
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+    }
+
+    ctx.reg_alloc.DefineValue(inst, result);
+}
+
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned8(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<8>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX<8>(code, ctx, inst);
         return;
     }
 
@@ -5365,6 +5803,11 @@ void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned16(EmitContext& ctx, IR:
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX<16>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s16>);
 }
 
@@ -5374,12 +5817,22 @@ void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned32(EmitContext& ctx, IR:
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX<32>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturationAndImmediate(code, ctx, inst, VectorSignedSaturatedShiftLeftUnsigned<s32>);
 }
 
 void EmitX64::EmitVectorSignedSaturatedShiftLeftUnsigned64(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
         EmitVectorSignedSaturatedShiftLeftUnsignedAVX512<64>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX)) {
+        EmitVectorSignedSaturatedShiftLeftUnsignedAVX<64>(code, ctx, inst);
         return;
     }
 
@@ -6363,6 +6816,29 @@ void EmitX64::EmitVectorUnsignedSaturatedNarrow64(EmitContext& ctx, IR::Inst* in
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::SSE41 | HostFeature::SSE42)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm src = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Reg32 bit = ctx.reg_alloc.ScratchGpr().cvt32();
+
+        // Elements above UINT32_MAX saturate. Flipping the sign bits turns the signed comparison into an unsigned one.
+        code.movdqa(xmm0, src);
+        code.pxor(xmm0, code.BConst<64>(xword, 0x8000000000000000));
+        code.pcmpgtq(xmm0, code.BConst<64>(xword, 0x80000000FFFFFFFF));
+        code.movmskpd(bit, xmm0);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
+
+        code.movdqa(dest, src);
+        code.por(dest, xmm0);
+
+        // Move the lower half of element 1 next to that of element 0, and zero the upper 64 bits
+        code.insertps(dest, dest, 0b10011100);
+
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
+
     EmitOneArgumentFallbackWithSaturation(code, ctx, inst, [](VectorArray<u32>& result, const VectorArray<u64>& a) {
         result = {};
         bool qc_flag = false;
@@ -6417,12 +6893,22 @@ void EmitX64::EmitVectorUnsignedSaturatedShiftLeft8(EmitContext& ctx, IR::Inst* 
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftWidenedAVX2<8, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u8>);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft16(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho | HostFeature::AVX512BW)) {
         EmitVectorSaturatedShiftLeftAVX512<16, false>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftWidenedAVX2<16, false>(code, ctx, inst);
         return;
     }
 
@@ -6435,12 +6921,22 @@ void EmitX64::EmitVectorUnsignedSaturatedShiftLeft32(EmitContext& ctx, IR::Inst*
         return;
     }
 
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftAVX2<32, false>(code, ctx, inst);
+        return;
+    }
+
     EmitTwoArgumentFallbackWithSaturation(code, ctx, inst, VectorUnsignedSaturatedShiftLeft<u32>);
 }
 
 void EmitX64::EmitVectorUnsignedSaturatedShiftLeft64(EmitContext& ctx, IR::Inst* inst) {
     if (code.HasHostFeature(HostFeature::AVX512_Ortho)) {
         EmitVectorSaturatedShiftLeftAVX512<64, false>(code, ctx, inst);
+        return;
+    }
+
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        EmitVectorSaturatedShiftLeftAVX2<64, false>(code, ctx, inst);
         return;
     }
 

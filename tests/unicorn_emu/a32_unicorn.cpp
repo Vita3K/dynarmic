@@ -23,15 +23,27 @@
 constexpr u32 BEGIN_ADDRESS = 0;
 constexpr u32 END_ADDRESS = ~u32(0);
 
+// Unicorn 2 fails uc_emu_start with UC_ERR_MAP if an access to the last page of the address space (e.g. a
+// PC-relative load with a negative offset that wraps around) has it mapped lazily by the unmapped memory
+// hook, so this page is always kept mapped instead.
+constexpr u32 LAST_PAGE_ADDRESS = 0xFFFFF000;
+
 template<class TestEnvironment>
 A32Unicorn<TestEnvironment>::A32Unicorn(TestEnvironment& testenv)
         : testenv{testenv} {
     constexpr uc_mode open_mode = std::is_same_v<TestEnvironment, ArmTestEnv> ? UC_MODE_ARM : UC_MODE_THUMB;
 
     CHECKED(uc_open(UC_ARCH_ARM, open_mode, &uc));
+    // The default CPU is a Cortex-A15, which doesn't have the ARMv8 instructions.
+    CHECKED(uc_ctl_set_cpu_model(uc, UC_CPU_ARM_MAX));
+    // Unicorn 2 starts in a privileged mode, so writing a user mode CPSR later would switch to the banked
+    // (zeroed) r13/r14 of the user mode. Enter user mode first so that the GPRs written afterwards stick.
+    constexpr u32 user_mode_cpsr = 0x10;
+    CHECKED(uc_reg_write(uc, UC_ARM_REG_CPSR, &user_mode_cpsr));
     CHECKED(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)InterruptHook, this, BEGIN_ADDRESS, END_ADDRESS));
     CHECKED(uc_hook_add(uc, &mem_invalid_hook, UC_HOOK_MEM_INVALID, (void*)UnmappedMemoryHook, this, BEGIN_ADDRESS, END_ADDRESS));
     CHECKED(uc_hook_add(uc, &mem_write_prot_hook, UC_HOOK_MEM_WRITE, (void*)MemoryWriteHook, this, BEGIN_ADDRESS, END_ADDRESS));
+    MapPage(LAST_PAGE_ADDRESS);
 }
 
 template<class TestEnvironment>
@@ -54,6 +66,13 @@ void A32Unicorn<TestEnvironment>::Run() {
         if (auto cerr_ = uc_emu_start(uc, pc, END_ADDRESS, 0, 1)) {
             fmt::print("uc_emu_start failed @ {:08x} (code = {:08x}) with error {} ({})", pc, *testenv.MemoryReadCode(pc), static_cast<size_t>(cerr_), uc_strerror(cerr_));
             throw "A32Unicorn::Run() failure";
+        }
+        if constexpr (std::is_same_v<TestEnvironment, ThumbTestEnv>) {
+            // Unicorn executes a whole IT block as a single instruction, but when it stops right after the
+            // block it can leave a stale IT state in the CPSR. That would wrongly make the next instruction
+            // conditional (and not flag-setting), so clear it.
+            constexpr u32 it_state_mask = 0x0600FC00;
+            SetCpsr(GetCpsr() & ~it_state_mask);
         }
         testenv.ticks_left--;
         if (!testenv.interrupts.empty() || testenv.code_mem_modified_by_guest) {
@@ -243,6 +262,29 @@ void A32Unicorn<TestEnvironment>::ClearPageCache() {
         CHECKED(uc_mem_unmap(uc, page->address, 4096));
     }
     pages.clear();
+    MapPage(LAST_PAGE_ADDRESS);
+}
+
+template<class TestEnvironment>
+void A32Unicorn<TestEnvironment>::MapPage(u32 base_address) {
+    const u32 permissions = [&]() -> u32 {
+        if (base_address < testenv.code_mem.size() * sizeof(typename TestEnvironment::InstructionType)) {
+            return UC_PROT_READ | UC_PROT_EXEC;
+        }
+        return UC_PROT_READ;
+    }();
+
+    auto page = std::make_unique<Page>();
+    page->address = base_address;
+    for (size_t i = 0; i < page->data.size(); ++i)
+        page->data[i] = testenv.MemoryRead8(static_cast<u32>(base_address + i));
+
+    uc_err err = uc_mem_map_ptr(uc, base_address, page->data.size(), permissions, page->data.data());
+    if (err == UC_ERR_MAP)
+        return;  // page already exists
+    CHECKED(err);
+
+    pages.emplace_back(std::move(page));
 }
 
 template<class TestEnvironment>
@@ -279,31 +321,8 @@ void A32Unicorn<TestEnvironment>::InterruptHook(uc_engine* /*uc*/, u32 int_numbe
 }
 
 template<class TestEnvironment>
-bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type /*type*/, u32 start_address, int size, u64 /*value*/, void* user_data) {
+bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* /*uc*/, uc_mem_type /*type*/, u32 start_address, int size, u64 /*value*/, void* user_data) {
     auto* this_ = static_cast<A32Unicorn*>(user_data);
-
-    const auto generate_page = [&](u32 base_address) {
-        // printf("generate_page(%x)\n", base_address);
-
-        const u32 permissions = [&]() -> u32 {
-            if (base_address < this_->testenv.code_mem.size() * sizeof(typename TestEnvironment::InstructionType)) {
-                return UC_PROT_READ | UC_PROT_EXEC;
-            }
-            return UC_PROT_READ;
-        }();
-
-        auto page = std::make_unique<Page>();
-        page->address = base_address;
-        for (size_t i = 0; i < page->data.size(); ++i)
-            page->data[i] = this_->testenv.MemoryRead8(static_cast<u32>(base_address + i));
-
-        uc_err err = uc_mem_map_ptr(uc, base_address, page->data.size(), permissions, page->data.data());
-        if (err == UC_ERR_MAP)
-            return;  // page already exists
-        CHECKED(err);
-
-        this_->pages.emplace_back(std::move(page));
-    };
 
     const auto is_in_range = [](u32 addr, u32 start, u32 end) {
         if (start <= end)
@@ -316,7 +335,7 @@ bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type 
 
     u32 current_address = start_address_page;
     do {
-        generate_page(current_address);
+        this_->MapPage(current_address);
         current_address += 0x1000;
     } while (is_in_range(current_address, start_address_page, end_address) && current_address != start_address_page);
 

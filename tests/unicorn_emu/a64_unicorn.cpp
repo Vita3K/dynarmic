@@ -21,6 +21,8 @@ constexpr u64 END_ADDRESS = ~u64(0);
 A64Unicorn::A64Unicorn(A64TestEnv& testenv)
         : testenv(testenv) {
     CHECKED(uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc));
+    // The default CPU is a Cortex-A72, which doesn't have the ARMv8.1+ instructions.
+    CHECKED(uc_ctl_set_cpu_model(uc, UC_CPU_ARM64_MAX));
     u64 fpv = 3 << 20;
     CHECKED(uc_reg_write(uc, UC_ARM64_REG_CPACR_EL1, &fpv));
     CHECKED(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)InterruptHook, this, BEGIN_ADDRESS, END_ADDRESS));
@@ -170,7 +172,7 @@ void A64Unicorn::InterruptHook(uc_engine* uc, u32 int_number, void* user_data) {
     auto* this_ = static_cast<A64Unicorn*>(user_data);
 
     u32 esr;
-    CHECKED(uc_reg_read(uc, UC_ARM64_REG_ESR, &esr));
+    CHECKED(uc_reg_read(uc, UC_ARM64_REG_ESR_EL1, &esr));
 
     auto ec = esr >> 26;
     auto iss = esr & 0xFFFFFF;

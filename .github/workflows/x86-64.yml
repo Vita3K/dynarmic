@@ -40,13 +40,19 @@ jobs:
         if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
         uses: actions/checkout@v5
         with:
-          repository: yuzu-emu-mirror/unicorn
+          repository: unicorn-engine/unicorn
+          ref: 2.1.4
           path: externals/unicorn
 
       - name: Build unicorn
         if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
         working-directory: externals/unicorn
-        run: UNICORN_ARCHS=aarch64,arm ./make.sh
+        env:
+          # Unicorn builds a universal binary on macOS unless told otherwise.
+          ARCHFLAGS: -arch x86_64
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DUNICORN_ARCH="arm;aarch64" -DUNICORN_BUILD_TESTS=OFF -DUNICORN_INSTALL=OFF -G Ninja
+          cmake --build build
 
       - name: Configure CMake
         if: ${{matrix.os == 'ubuntu-latest'}}
@@ -63,7 +69,7 @@ jobs:
           -DDYNARMIC_TESTS_USE_UNICORN=1
           -DDYNARMIC_USE_LLVM=1
           -DLIBUNICORN_INCLUDE_DIR=${{github.workspace}}/externals/unicorn/include
-          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
+          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/build/libunicorn.a
           -G Ninja
 
       # Uses the Homebrew LLVM that is preinstalled on the runner image.
@@ -78,7 +84,7 @@ jobs:
           -DDYNARMIC_TESTS_USE_UNICORN=1
           -DDYNARMIC_USE_LLVM=1
           -DLIBUNICORN_INCLUDE_DIR=${{github.workspace}}/externals/unicorn/include
-          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
+          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/build/libunicorn.a
           -DLLVM_DIR=$(brew --prefix llvm@18)/lib/cmake/llvm
           -G Ninja
 

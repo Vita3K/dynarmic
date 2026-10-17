@@ -1542,6 +1542,12 @@ template<size_t fsize>
 static void EmitRecipEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     using FPT = mcl::unsigned_integer_of_size<fsize>;
 
+    const auto fallback_fn = [](VectorArray<FPT>& result, const VectorArray<FPT>& operand, FP::FPCR fpcr, FP::FPSR& fpsr) {
+        for (size_t i = 0; i < result.size(); i++) {
+            result[i] = FP::FPRecipEstimate<FPT>(operand[i], fpcr, fpsr);
+        }
+    };
+
     if constexpr (fsize != 16) {
         if (ctx.HasOptimization(OptimizationFlag::Unsafe_ReducedErrorFP)) {
             auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -1563,13 +1569,69 @@ static void EmitRecipEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
             ctx.reg_alloc.DefineValue(inst, result);
             return;
         }
+
+        if (code.HasHostFeature(HostFeature::AVX)) {
+            auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+            const bool fpcr_controlled = args[1].GetImmediateU1();
+
+            const Xbyak::Xmm operand = ctx.reg_alloc.UseXmm(args[0]);
+            const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+            const Xbyak::Xmm value = ctx.reg_alloc.ScratchXmm();
+
+            SharedLabel bad_values = GenSharedLabel(), end = GenSharedLabel();
+
+            // The estimate only depends on the 8 most significant mantissa bits. Dividing 1.0 by the midpoint of that
+            // interval and rounding the quotient to 8 mantissa bits reproduces the reference table exactly.
+            constexpr size_t mantissa_width = FP::FPInfo<FPT>::explicit_mantissa_width;
+            constexpr FPT estimate_mask = static_cast<FPT>(~((FPT(1) << (mantissa_width - 8)) - 1));
+            constexpr FPT estimate_half = FPT(1) << (mantissa_width - 9);
+
+            // Normal inputs below 2^(bias - 1) have normal estimates. Check |operand| against that range with a signed compare.
+            constexpr FPT sign_bit = FPT(1) << (fsize - 1);
+            constexpr FPT smallest_normal = FPT(1) << mantissa_width;
+            constexpr FPT first_large = FPT(2 * FP::FPInfo<FPT>::exponent_bias - 1) << mantissa_width;
+            constexpr FPT range_bias = sign_bit - smallest_normal;
+            constexpr FPT range_limit = sign_bit + (first_large - smallest_normal) - 1;
+
+            code.vpand(value, operand, GetNonSignMaskVector<fsize>(code));
+            code.vpxor(xmm0, xmm0, xmm0);
+            ICODE(vpcmpeq)(xmm0, xmm0, value);
+            ICODE(vpadd)(value, value, GetVectorOf<fsize, range_bias>(code));
+            ICODE(vpcmpgt)(value, value, GetVectorOf<fsize, range_limit>(code));
+
+            // Zeros are handled inline: 1.0 / ±0 is ±inf and raises divide-by-zero on both architectures.
+            // This matters for 64-bit A32 vectors, whose upper half is always zero.
+            code.vptest(xmm0, value);
+            code.jnc(*bad_values, code.T_NEAR);
+
+            code.vpand(value, operand, GetVectorOf<fsize, estimate_mask>(code));
+            code.vpandn(result, xmm0, GetVectorOf<fsize, estimate_half>(code));
+            code.vpor(value, value, result);
+
+            code.vmovaps(result, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code));
+            FCODE(vdivp)(result, result, value);
+
+            ICODE(vpadd)(result, result, GetVectorOf<fsize, estimate_half>(code));
+            code.vpand(result, result, GetVectorOf<fsize, estimate_mask>(code));
+
+            code.L(*end);
+
+            ctx.deferred_emits.emplace_back([=, &code, &ctx] {
+                code.L(*bad_values);
+                code.sub(rsp, 8);
+                ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(result.getIdx()));
+                EmitTwoOpFallbackWithoutRegAlloc(code, ctx, result, operand, fallback_fn, fpcr_controlled);
+                ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(result.getIdx()));
+                code.add(rsp, 8);
+                code.jmp(*end, code.T_NEAR);
+            });
+
+            ctx.reg_alloc.DefineValue(inst, result);
+            return;
+        }
     }
 
-    EmitTwoOpFallback(code, ctx, inst, [](VectorArray<FPT>& result, const VectorArray<FPT>& operand, FP::FPCR fpcr, FP::FPSR& fpsr) {
-        for (size_t i = 0; i < result.size(); i++) {
-            result[i] = FP::FPRecipEstimate<FPT>(operand[i], fpcr, fpsr);
-        }
-    });
+    EmitTwoOpFallback(code, ctx, inst, fallback_fn);
 }
 
 void EmitX64::EmitFPVectorRecipEstimate16(EmitContext& ctx, IR::Inst* inst) {
@@ -1790,23 +1852,29 @@ static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
 
             SharedLabel bad_values = GenSharedLabel(), end = GenSharedLabel();
 
-            code.movaps(value, operand);
+            constexpr FPT estimate_mask = static_cast<FPT>(fsize == 32 ? 0xFFFF8000 : 0xFFFF'F000'0000'0000);
 
-            code.movaps(xmm0, GetVectorOf<fsize, (fsize == 32 ? 0xFFFF8000 : 0xFFFF'F000'0000'0000)>(code));
-            code.pand(value, xmm0);
-            code.por(value, GetVectorOf<fsize, (fsize == 32 ? 0x00008000 : 0x0000'1000'0000'0000)>(code));
+            // Zeros are handled inline: 1.0 / sqrt(±0) is ±inf and raises divide-by-zero on both architectures.
+            // This matters for 64-bit A32 vectors, whose upper half is always zero.
+            code.vpand(value, operand, GetNonSignMaskVector<fsize>(code));
+            code.vpxor(xmm0, xmm0, xmm0);
+            ICODE(vpcmpeq)(xmm0, xmm0, value);
 
-            // Detect NaNs, negatives, zeros, denormals and infinities
+            code.vpand(value, operand, GetVectorOf<fsize, estimate_mask>(code));
+            code.vpandn(result, xmm0, GetVectorOf<fsize, (fsize == 32 ? 0x00008000 : 0x0000'1000'0000'0000)>(code));
+            code.vpor(value, value, result);
+
+            // Detect NaNs, negatives, denormals and infinities
             FCODE(vcmpnge_uqp)(result, value, GetVectorOf<fsize, (FPT(1) << FP::FPInfo<FPT>::explicit_mantissa_width)>(code));
-            code.vptest(result, result);
-            code.jnz(*bad_values, code.T_NEAR);
+            code.vptest(xmm0, result);
+            code.jnc(*bad_values, code.T_NEAR);
 
-            FCODE(sqrtp)(value, value);
+            FCODE(vsqrtp)(value, value);
             code.vmovaps(result, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code));
-            FCODE(divp)(result, value);
+            FCODE(vdivp)(result, result, value);
 
-            ICODE(padd)(result, GetVectorOf<fsize, (fsize == 32 ? 0x00004000 : 0x0000'0800'0000'0000)>(code));
-            code.pand(result, xmm0);
+            ICODE(vpadd)(result, result, GetVectorOf<fsize, (fsize == 32 ? 0x00004000 : 0x0000'0800'0000'0000)>(code));
+            code.vpand(result, result, GetVectorOf<fsize, estimate_mask>(code));
 
             code.L(*end);
 

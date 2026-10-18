@@ -6,6 +6,7 @@
 #include "dynarmic/backend/x64/emit_x64.h"
 
 #include <iterator>
+#include <string_view>
 
 #include <mcl/assert.hpp>
 #include <mcl/bit/bit_field.hpp>
@@ -54,29 +55,56 @@ void SwitchToGuestMXCSR(BlockOfCode& code, EmitContext& ctx) {
     }
 }
 
+// Instructions that are neither floating-point instructions nor specific to a frontend already run with any guest
+// MXCSR, so they do not depend on which MXCSR is loaded, and any exceptions they raise end up in FPSR either way.
+// Instructions specific to a frontend may call host code or access the guest MXCSR.
+static constexpr bool IsGeneralNonFPOpcode(IR::Opcode op) {
+    switch (op) {
+#define OPCODE(name, type, ...) \
+    case IR::Opcode::name:      \
+        return !std::string_view{#name}.starts_with("FP");
+#define A32OPC(name, type, ...) \
+    case IR::Opcode::A32##name: \
+        return false;
+#define A64OPC(name, type, ...) \
+    case IR::Opcode::A64##name: \
+        return false;
+#include "dynarmic/ir/opcodes.inc"
+#undef OPCODE
+#undef A32OPC
+#undef A64OPC
+    default:
+        return false;
+    }
+}
+
 bool CanEmitWithStandardASIMDMXCSR(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
-    // These neither depend on MXCSR nor call into host code.
+    // These only access the guest state.
+    case IR::Opcode::A32SetCheckBit:
+    case IR::Opcode::A32GetRegister:
     case IR::Opcode::A32GetExtendedRegister32:
     case IR::Opcode::A32GetExtendedRegister64:
     case IR::Opcode::A32GetVector:
+    case IR::Opcode::A32SetRegister:
     case IR::Opcode::A32SetExtendedRegister32:
     case IR::Opcode::A32SetExtendedRegister64:
     case IR::Opcode::A32SetVector:
-    case IR::Opcode::VectorAnd:
-    case IR::Opcode::VectorAndNot:
-    case IR::Opcode::VectorBroadcast32:
-    case IR::Opcode::VectorBroadcastElement32:
-    case IR::Opcode::VectorBroadcastElementLower32:
-    case IR::Opcode::VectorBroadcastLower32:
-    case IR::Opcode::VectorEor:
-    case IR::Opcode::VectorExtract:
-    case IR::Opcode::VectorExtractLower:
-    case IR::Opcode::VectorGetElement32:
-    case IR::Opcode::VectorNot:
-    case IR::Opcode::VectorOr:
-    case IR::Opcode::VectorSetElement32:
-    case IR::Opcode::VectorZeroUpper:
+    case IR::Opcode::A32GetCpsr:
+    case IR::Opcode::A32SetCpsr:
+    case IR::Opcode::A32SetCpsrNZCV:
+    case IR::Opcode::A32SetCpsrNZCVRaw:
+    case IR::Opcode::A32SetCpsrNZCVQ:
+    case IR::Opcode::A32SetCpsrNZ:
+    case IR::Opcode::A32SetCpsrNZC:
+    case IR::Opcode::A32GetCFlag:
+    case IR::Opcode::A32OrQFlag:
+    case IR::Opcode::A32GetGEFlags:
+    case IR::Opcode::A32SetGEFlags:
+    case IR::Opcode::A32SetGEFlagsCompressed:
+    case IR::Opcode::A32GetFpscrNZCV:
+    case IR::Opcode::A32SetFpscrNZCV:
+    // These neither depend on MXCSR nor raise floating-point exceptions.
     case IR::Opcode::FPVectorAbs32:
     case IR::Opcode::FPVectorNeg32:
         return true;
@@ -101,8 +129,10 @@ bool CanEmitWithStandardASIMDMXCSR(const IR::Inst& inst) {
     case IR::Opcode::FPVectorToSignedFixed32:
     case IR::Opcode::FPVectorToUnsignedFixed32:
         return !inst.GetArg(inst.NumArgs() - 1).GetU1();
-    default:
+    case IR::Opcode::CallHostFunction:
         return false;
+    default:
+        return IsGeneralNonFPOpcode(inst.GetOpcode());
     }
 }
 

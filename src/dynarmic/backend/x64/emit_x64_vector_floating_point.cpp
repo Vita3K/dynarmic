@@ -1538,6 +1538,39 @@ void EmitX64::EmitFPVectorPairedAddLower64(EmitContext& ctx, IR::Inst* inst) {
     });
 }
 
+// The save slot of the MXCSR that is currently loaded. It is free to use until that MXCSR is switched out.
+static Xbyak::Address CurrentMXCSRSaveSlot(BlockOfCode& code, EmitContext& ctx) {
+    const auto& jsi = code.GetJitStateInfo();
+    return code.dword[code.r15 + (ctx.standard_asimd_mxcsr ? jsi.offsetof_asimd_MXCSR : jsi.offsetof_guest_MXCSR)];
+}
+
+// The quotients (and square roots) in the estimate fast paths are inexact, which raises the inexact exception,
+// while the reference implementations do not raise it for these inputs. SaveInexactException records whether
+// it was already raised, and RestoreInexactException clears it again if it was not.
+static void SaveInexactException(BlockOfCode& code, EmitContext& ctx) {
+    code.stmxcsr(CurrentMXCSRSaveSlot(code, ctx));
+}
+
+static void RestoreInexactException(BlockOfCode& code, EmitContext& ctx) {
+    constexpr u32 mxcsr_pe = 1 << 5;
+    const Xbyak::Address slot = CurrentMXCSRSaveSlot(code, ctx);
+
+    SharedLabel clear = GenSharedLabel(), end = GenSharedLabel();
+
+    // Usually already raised by an earlier instruction, in which case there is nothing to do
+    code.test(slot, mxcsr_pe);
+    code.jz(*clear, code.T_NEAR);
+    code.L(*end);
+
+    ctx.deferred_emits.emplace_back([=, &code] {
+        code.L(*clear);
+        code.stmxcsr(slot);
+        code.and_(slot, ~mxcsr_pe);
+        code.ldmxcsr(slot);
+        code.jmp(*end, code.T_NEAR);
+    });
+}
+
 template<size_t fsize>
 static void EmitRecipEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     using FPT = mcl::unsigned_integer_of_size<fsize>;
@@ -1608,8 +1641,10 @@ static void EmitRecipEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
             code.vpandn(result, xmm0, GetVectorOf<fsize, estimate_half>(code));
             code.vpor(value, value, result);
 
+            SaveInexactException(code, ctx);
             code.vmovaps(result, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code));
             FCODE(vdivp)(result, result, value);
+            RestoreInexactException(code, ctx);
 
             ICODE(vpadd)(result, result, GetVectorOf<fsize, estimate_half>(code));
             code.vpand(result, result, GetVectorOf<fsize, estimate_mask>(code));
@@ -1869,9 +1904,11 @@ static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
             code.vptest(xmm0, result);
             code.jnc(*bad_values, code.T_NEAR);
 
+            SaveInexactException(code, ctx);
             FCODE(vsqrtp)(value, value);
             code.vmovaps(result, GetVectorOf<fsize, FP::FPValue<FPT, false, 0, 1>()>(code));
             FCODE(vdivp)(result, result, value);
+            RestoreInexactException(code, ctx);
 
             ICODE(vpadd)(result, result, GetVectorOf<fsize, (fsize == 32 ? 0x00004000 : 0x0000'0800'0000'0000)>(code));
             code.vpand(result, result, GetVectorOf<fsize, estimate_mask>(code));

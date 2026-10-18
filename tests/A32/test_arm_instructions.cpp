@@ -527,6 +527,36 @@ TEST_CASE("arm: vcvt.s16.f64", "[arm][A32]") {
     REQUIRE(jit.ExtRegs()[17] == 0xffffffff);
 }
 
+TEST_CASE("arm: vrecpe.f32 and vrsqrte.f32 exceptions", "[arm][A32]") {
+    // Estimates of normal values are not inexact, while estimates of zeros raise divide-by-zero
+    for (const u32 instruction : {
+             0xf3bb0502,  // vrecpe.f32 d0, d2
+             0xf3bb0582,  // vrsqrte.f32 d0, d2
+         }) {
+        // The first FPSCR value differs from the standard FPSCR value that ASIMD instructions use, the second does not
+        for (const u32 fpscr : {0x00000000, 0x03000000}) {
+            ArmTestEnv test_env;
+            A32::Jit jit{GetUserConfig(&test_env)};
+            test_env.code_mem = {
+                instruction,
+                0xeafffffe,  // b +#0
+            };
+
+            jit.ExtRegs()[4] = 0x40400000;  // 3.0
+            jit.ExtRegs()[5] = 0x00000000;  // 0.0
+
+            jit.SetFpscr(fpscr);
+            jit.SetCpsr(0x000001d0);  // User-mode
+
+            test_env.ticks_left = 2;
+            jit.Run();
+
+            REQUIRE(jit.ExtRegs()[1] == 0x7f800000);
+            REQUIRE((jit.Fpscr() & 0x9f) == 0x02);  // DZC only
+        }
+    }
+}
+
 TEST_CASE("arm: Memory access (fastmem)", "[arm][A32]") {
     constexpr size_t address_width = 12;
     constexpr size_t memory_size = 1ull << address_width;  // 4K

@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 
+#include <string_view>
+
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/abi.h"
@@ -175,6 +177,115 @@ void EmitIR<IR::Opcode::NZCVFromPackedFlags>(oaknut::CodeGenerator&, EmitContext
     ctx.reg_alloc.DefineAsExisting(inst, args[0]);
 }
 
+void SwitchToStandardFPCR(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    if (!ctx.standard_fpcr_loaded) {
+        code.MOV(Wscratch0, ctx.FPCR(false).Value());
+        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+        ctx.standard_fpcr_loaded = true;
+    }
+}
+
+void SwitchToGuestFPCR(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    if (ctx.standard_fpcr_loaded) {
+        code.MOV(Wscratch0, ctx.FPCR().Value());
+        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+        ctx.standard_fpcr_loaded = false;
+    }
+}
+
+enum class FPCRUse {
+    /// Neither floating-point nor specific to a frontend, so it does not depend on FPCR.
+    None,
+    /// An ASIMD floating-point instruction, which selects the FPCR it needs via MaybeStandardFPSCRValue.
+    /// Its last argument is fpcr_controlled.
+    SelectsFPCR,
+    /// Other floating-point instructions use the guest FPCR, and instructions specific to a frontend may call host code.
+    GuestFPCR,
+};
+
+static constexpr FPCRUse GetFPCRUseOfGeneralOpcode(std::string_view name) {
+    if (name.starts_with("FPVector")) {
+        return FPCRUse::SelectsFPCR;
+    }
+    if (name.starts_with("FP")) {
+        return FPCRUse::GuestFPCR;
+    }
+    return FPCRUse::None;
+}
+
+static constexpr FPCRUse GetFPCRUse(IR::Opcode op) {
+    switch (op) {
+#define OPCODE(name, type, ...) \
+    case IR::Opcode::name:      \
+        return GetFPCRUseOfGeneralOpcode(#name);
+#define A32OPC(name, type, ...) \
+    case IR::Opcode::A32##name: \
+        return FPCRUse::GuestFPCR;
+#define A64OPC(name, type, ...) \
+    case IR::Opcode::A64##name: \
+        return FPCRUse::GuestFPCR;
+#include "dynarmic/ir/opcodes.inc"
+#undef OPCODE
+#undef A32OPC
+#undef A64OPC
+    default:
+        return FPCRUse::GuestFPCR;
+    }
+}
+
+// Whether inst may be emitted while the ASIMD standard FPCR value is loaded.
+// The guest FPCR must be restored before any other instruction and before the block terminal.
+static bool CanEmitWithStandardFPCR(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    // These only access the guest state.
+    case IR::Opcode::A32SetCheckBit:
+    case IR::Opcode::A32GetRegister:
+    case IR::Opcode::A32GetExtendedRegister32:
+    case IR::Opcode::A32GetExtendedRegister64:
+    case IR::Opcode::A32GetVector:
+    case IR::Opcode::A32SetRegister:
+    case IR::Opcode::A32SetExtendedRegister32:
+    case IR::Opcode::A32SetExtendedRegister64:
+    case IR::Opcode::A32SetVector:
+    case IR::Opcode::A32GetCpsr:
+    case IR::Opcode::A32SetCpsr:
+    case IR::Opcode::A32SetCpsrNZCV:
+    case IR::Opcode::A32SetCpsrNZCVRaw:
+    case IR::Opcode::A32SetCpsrNZCVQ:
+    case IR::Opcode::A32SetCpsrNZ:
+    case IR::Opcode::A32SetCpsrNZC:
+    case IR::Opcode::A32GetCFlag:
+    case IR::Opcode::A32OrQFlag:
+    case IR::Opcode::A32GetGEFlags:
+    case IR::Opcode::A32SetGEFlags:
+    case IR::Opcode::A32SetGEFlagsCompressed:
+    case IR::Opcode::A32GetFpscrNZCV:
+    case IR::Opcode::A32SetFpscrNZCV:
+    // These neither depend on FPCR nor raise floating-point exceptions.
+    case IR::Opcode::FPVectorAbs16:
+    case IR::Opcode::FPVectorAbs32:
+    case IR::Opcode::FPVectorAbs64:
+    case IR::Opcode::FPVectorNeg16:
+    case IR::Opcode::FPVectorNeg32:
+    case IR::Opcode::FPVectorNeg64:
+        return true;
+    case IR::Opcode::CallHostFunction:
+        return false;
+    default:
+        break;
+    }
+
+    switch (GetFPCRUse(inst.GetOpcode())) {
+    case FPCRUse::None:
+        return true;
+    case FPCRUse::SelectsFPCR:
+        return !inst.GetArg(inst.NumArgs() - 1).GetU1();
+    case FPCRUse::GuestFPCR:
+    default:
+        return false;
+    }
+}
+
 static void EmitAddCycles(oaknut::CodeGenerator& code, EmitContext& ctx, size_t cycles_to_add) {
     if (!ctx.conf.enable_cycle_counting) {
         return;
@@ -220,6 +331,10 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     for (auto iter = block.begin(); iter != block.end(); ++iter) {
         IR::Inst* inst = &*iter;
 
+        if (!CanEmitWithStandardFPCR(*inst)) {
+            SwitchToGuestFPCR(code, ctx);
+        }
+
         switch (inst->GetOpcode()) {
 #define OPCODE(name, type, ...)                    \
     case IR::Opcode::name:                         \
@@ -246,10 +361,12 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
         reg_alloc.AssertAllUnlocked();
 
         if (conf.very_verbose_debugging_output) {
+            SwitchToGuestFPCR(code, ctx);
             EmitVerboseDebuggingOutput(code, ctx);
         }
     }
 
+    SwitchToGuestFPCR(code, ctx);
     fpsr_manager.Spill();
 
     reg_alloc.AssertNoMoreUses();

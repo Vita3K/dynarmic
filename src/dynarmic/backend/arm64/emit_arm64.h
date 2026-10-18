@@ -169,6 +169,14 @@ template<IR::Opcode op>
 void EmitIR(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);
 void EmitRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, LinkTarget link_target);
 void EmitBlockLinkRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::LocationDescriptor& descriptor, BlockRelocationType type);
+
+/// Loads the ASIMD standard FPCR value unless it is already loaded. It stays loaded across subsequent instructions until
+/// SwitchToGuestFPCR is called, so consecutive instructions that use the standard FPSCR value only switch once.
+void SwitchToStandardFPCR(oaknut::CodeGenerator& code, EmitContext& ctx);
+
+/// Reloads the guest FPCR if the ASIMD standard FPCR value is loaded.
+void SwitchToGuestFPCR(oaknut::CodeGenerator& code, EmitContext& ctx);
+
 oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond);
 oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond);
 void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx);

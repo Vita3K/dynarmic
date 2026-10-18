@@ -42,6 +42,9 @@ struct EmitContext {
 
     std::vector<std::function<void()>> deferred_emits;
 
+    /// Whether the ASIMD standard FPCR value is currently loaded in place of the guest FPCR.
+    bool standard_fpcr_loaded = false;
+
     FP::FPCR FPCR(bool fpcr_controlled = true) const {
         const FP::FPCR fpcr = conf.descriptor_to_fpcr(block.Location());
         return fpcr_controlled ? fpcr : fpcr.ASIMDStandardValue();

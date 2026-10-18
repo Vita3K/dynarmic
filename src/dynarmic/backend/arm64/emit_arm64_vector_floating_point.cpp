@@ -49,13 +49,28 @@ using VectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T>>
 template<typename EmitFn>
 static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ctx, bool fpcr_controlled, EmitFn emit) {
     if (ctx.FPCR(fpcr_controlled) != ctx.FPCR()) {
-        code.MOV(Wscratch0, ctx.FPCR(fpcr_controlled).Value());
-        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
-        emit();
-        code.MOV(Wscratch0, ctx.FPCR().Value());
-        code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+        // Stays loaded for following instructions that can use it, see CanEmitWithStandardFPCR.
+        SwitchToStandardFPCR(code, ctx);
     } else {
-        emit();
+        SwitchToGuestFPCR(code, ctx);
+    }
+    emit();
+}
+
+// For instructions that neither depend on FPCR nor raise floating-point exceptions.
+template<size_t size, typename EmitFn>
+static void EmitTwoOpArrangedWithoutFPCR(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, EmitFn emit) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Qresult = ctx.reg_alloc.WriteQ(inst);
+    auto Qa = ctx.reg_alloc.ReadQ(args[0]);
+    RegAlloc::Realize(Qresult, Qa);
+
+    if constexpr (size == 32) {
+        emit(Qresult->S4(), Qa->S4());
+    } else if constexpr (size == 64) {
+        emit(Qresult->D2(), Qa->D2());
+    } else {
+        static_assert(Common::always_false_v<mcl::mp::lift_value<size>>);
     }
 }
 
@@ -266,6 +281,8 @@ static void EmitTwoOpFallbackWithoutRegAlloc(oaknut::CodeGenerator& code, EmitCo
     const u32 fpcr = ctx.FPCR(fpcr_controlled).Value();
     constexpr u64 stack_size = sizeof(u64) * 4;  // sizeof(u128) * 2
 
+    SwitchToGuestFPCR(code, ctx);
+
     ABI_PushRegisters(code, ABI_CALLER_SAVE & ~(1ull << Qresult.index()), stack_size);
 
     code.MOV(Xscratch0, mcl::bit_cast<u64>(fn));
@@ -304,12 +321,12 @@ void EmitIR<IR::Opcode::FPVectorAbs16>(oaknut::CodeGenerator& code, EmitContext&
 
 template<>
 void EmitIR<IR::Opcode::FPVectorAbs32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArranged<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPVectorAbs64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
 }
 
 template<>
@@ -495,12 +512,12 @@ void EmitIR<IR::Opcode::FPVectorNeg16>(oaknut::CodeGenerator& code, EmitContext&
 
 template<>
 void EmitIR<IR::Opcode::FPVectorNeg32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArranged<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPVectorNeg64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
 }
 
 template<>

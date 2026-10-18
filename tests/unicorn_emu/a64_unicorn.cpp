@@ -171,8 +171,10 @@ void A64Unicorn::DumpMemoryInformation() {
 void A64Unicorn::InterruptHook(uc_engine* uc, u32 int_number, void* user_data) {
     auto* this_ = static_cast<A64Unicorn*>(user_data);
 
-    u32 esr;
-    CHECKED(uc_reg_read(uc, UC_ARM64_REG_ESR_EL1, &esr));
+    // Unicorn 2 stores all 64 bits of ESR_EL1, so the buffer must be 64 bits wide.
+    u64 esr_el1;
+    CHECKED(uc_reg_read(uc, UC_ARM64_REG_ESR_EL1, &esr_el1));
+    const auto esr = static_cast<u32>(esr_el1);
 
     auto ec = esr >> 26;
     auto iss = esr & 0xFFFFFF;

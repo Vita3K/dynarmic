@@ -557,6 +557,45 @@ TEST_CASE("arm: vrecpe.f32 and vrsqrte.f32 exceptions", "[arm][A32]") {
     }
 }
 
+TEST_CASE("arm: ASIMD and VFP instructions with a non-standard FPSCR", "[arm][A32]") {
+    // ASIMD floating-point instructions round to nearest, while VFP instructions use the rounding mode in FPSCR.
+    // Both raise their exceptions in FPSCR, which VMRS reads in the same block.
+    ArmTestEnv test_env;
+    A32::Jit jit{GetUserConfig(&test_env)};
+    test_env.code_mem = {
+        0xf2010d02,  // vadd.f32 d0, d1, d2
+        0xf2276807,  // vadd.i32 d6, d7, d7
+        0xee344a85,  // vadd.f32 s8, s9, s10
+        0xf2013d02,  // vadd.f32 d3, d1, d2
+        0xeaffffff,  // b +#4
+        0xee745a85,  // vadd.f32 s11, s9, s10
+        0xeef10a10,  // vmrs r0, fpscr
+        0xeafffffe,  // b +#0
+    };
+
+    jit.ExtRegs()[2] = jit.ExtRegs()[3] = jit.ExtRegs()[9] = 0x3f800000;   // 1.0
+    jit.ExtRegs()[4] = jit.ExtRegs()[5] = jit.ExtRegs()[10] = 0x30800000;  // 2^-30
+    jit.ExtRegs()[14] = 1;
+    jit.ExtRegs()[15] = 2;
+
+    jit.SetFpscr(0x00400000);  // Round towards plus infinity
+    jit.SetCpsr(0x000001d0);   // User-mode
+
+    test_env.ticks_left = 8;
+    jit.Run();
+
+    REQUIRE(jit.ExtRegs()[0] == 0x3f800000);
+    REQUIRE(jit.ExtRegs()[1] == 0x3f800000);
+    REQUIRE(jit.ExtRegs()[12] == 2);
+    REQUIRE(jit.ExtRegs()[13] == 4);
+    REQUIRE(jit.ExtRegs()[8] == 0x3f800001);
+    REQUIRE(jit.ExtRegs()[6] == 0x3f800000);
+    REQUIRE(jit.ExtRegs()[7] == 0x3f800000);
+    REQUIRE(jit.ExtRegs()[11] == 0x3f800001);
+    REQUIRE(jit.Regs()[0] == 0x00400010);  // IXC
+    REQUIRE(jit.Fpscr() == 0x00400010);
+}
+
 TEST_CASE("arm: Memory access (fastmem)", "[arm][A32]") {
     constexpr size_t address_width = 12;
     constexpr size_t memory_size = 1ull << address_width;  // 4K

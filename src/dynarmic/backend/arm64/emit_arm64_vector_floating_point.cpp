@@ -59,7 +59,7 @@ static void MaybeStandardFPSCRValue(oaknut::CodeGenerator& code, EmitContext& ct
 
 // For instructions that neither depend on FPCR nor raise floating-point exceptions.
 template<size_t size, typename EmitFn>
-static void EmitTwoOpArrangedWithoutFPCR(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, EmitFn emit) {
+static void EmitTwoOpArrangedWithoutFPCR(EmitContext& ctx, IR::Inst* inst, EmitFn emit) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     auto Qresult = ctx.reg_alloc.WriteQ(inst);
     auto Qa = ctx.reg_alloc.ReadQ(args[0]);
@@ -321,12 +321,12 @@ void EmitIR<IR::Opcode::FPVectorAbs16>(oaknut::CodeGenerator& code, EmitContext&
 
 template<>
 void EmitIR<IR::Opcode::FPVectorAbs32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArrangedWithoutFPCR<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<32>(ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPVectorAbs64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArrangedWithoutFPCR<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<64>(ctx, inst, [&](auto Vresult, auto Va) { code.FABS(Vresult, Va); });
 }
 
 template<>
@@ -512,12 +512,12 @@ void EmitIR<IR::Opcode::FPVectorNeg16>(oaknut::CodeGenerator& code, EmitContext&
 
 template<>
 void EmitIR<IR::Opcode::FPVectorNeg32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArrangedWithoutFPCR<32>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<32>(ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPVectorNeg64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitTwoOpArrangedWithoutFPCR<64>(code, ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
+    EmitTwoOpArrangedWithoutFPCR<64>(ctx, inst, [&](auto Vresult, auto Va) { code.FNEG(Vresult, Va); });
 }
 
 template<>

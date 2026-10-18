@@ -51,7 +51,9 @@ jobs:
           # Unicorn builds a universal binary on macOS unless told otherwise.
           ARCHFLAGS: -arch x86_64
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DUNICORN_ARCH="arm;aarch64" -DUNICORN_BUILD_TESTS=OFF -DUNICORN_INSTALL=OFF -G Ninja
+          # QEMU's own configure passes -fwrapv and -fno-strict-aliasing, but unicorn's CMake build doesn't.
+          # Without -fwrapv clang folds the signed overflow in neon_abd_s32 into abs(), which breaks SABD/SABA/VABD/VABA on 32-bit elements.
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-fwrapv -fno-strict-aliasing" -DBUILD_SHARED_LIBS=OFF -DUNICORN_ARCH="arm;aarch64" -DUNICORN_BUILD_TESTS=OFF -DUNICORN_INSTALL=OFF -G Ninja
           cmake --build build
 
       - name: Configure CMake

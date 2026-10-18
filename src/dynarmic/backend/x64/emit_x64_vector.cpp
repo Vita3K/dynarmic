@@ -31,16 +31,7 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
-#define ICODE(NAME)                  \
-    [&code](auto... args) {          \
-        if constexpr (esize == 32) { \
-            code.NAME##d(args...);   \
-        } else {                     \
-            code.NAME##q(args...);   \
-        }                            \
-    }
-
-#define WDQCODE(NAME)                       \
+#define ICODE(NAME)                         \
     [&code](auto... args) {                 \
         if constexpr (esize == 16) {        \
             code.NAME##w(args...);          \
@@ -675,17 +666,24 @@ static std::array<Xbyak::Xmm, 32 / esize> EmitWidenedShiftRightAVX2(BlockOfCode&
     return result;
 }
 
+// Packs the 32-bit results of EmitWidenedShiftRightAVX2 for 8-bit elements, which must fit in 16 bits,
+// into the 16-bit elements of wide[0] and wide[1].
+template<bool is_signed>
+static void EmitWidenedPack8To16AVX2(BlockOfCode& code, const std::array<Xbyak::Xmm, 4>& wide) {
+    if constexpr (is_signed) {
+        code.vpackssdw(wide[0], wide[0], wide[1]);
+        code.vpackssdw(wide[1], wide[2], wide[3]);
+    } else {
+        code.vpackusdw(wide[0], wide[0], wide[1]);
+        code.vpackusdw(wide[1], wide[2], wide[3]);
+    }
+}
+
 // Truncates the results of EmitWidenedShiftRightAVX2 to esize bits. 8-bit results must fit in 16 bits.
 template<size_t esize, bool is_signed>
 static void EmitWidenedTruncateAVX2(BlockOfCode& code, const Xbyak::Xmm& result, const std::array<Xbyak::Xmm, 32 / esize>& wide) {
     if constexpr (esize == 8) {
-        if constexpr (is_signed) {
-            code.vpackssdw(wide[0], wide[0], wide[1]);
-            code.vpackssdw(wide[1], wide[2], wide[3]);
-        } else {
-            code.vpackusdw(wide[0], wide[0], wide[1]);
-            code.vpackusdw(wide[1], wide[2], wide[3]);
-        }
+        EmitWidenedPack8To16AVX2<is_signed>(code, wide);
         code.vpand(wide[0], wide[0], code.BConst<16>(xword, 0xFF));
         code.vpand(wide[1], wide[1], code.BConst<16>(xword, 0xFF));
         code.vpackuswb(result, wide[0], wide[1]);
@@ -3986,9 +3984,9 @@ static void EmitRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, IR::Inst*
 
     const auto shift_right = [&](const Xbyak::Xmm& dst, const Xbyak::Xmm& src, const Xbyak::Xmm& amount) {
         if constexpr (is_signed) {
-            WDQCODE(vpsrav)(dst, src, amount);
+            ICODE(vpsrav)(dst, src, amount);
         } else {
-            WDQCODE(vpsrlv)(dst, src, amount);
+            ICODE(vpsrlv)(dst, src, amount);
         }
     };
 
@@ -4001,7 +3999,7 @@ static void EmitRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, IR::Inst*
 
     // if b is positive, do a normal left shift
     const Xbyak::Xmm left_shift = ctx.reg_alloc.ScratchXmm();
-    WDQCODE(vpsllv)(left_shift, a, shift_amount);
+    ICODE(vpsllv)(left_shift, a, shift_amount);
 
     // if b is negative, compute the rounding right shift
     // ARM documentation describes it as:
@@ -4016,18 +4014,18 @@ static void EmitRoundingShiftLeft(BlockOfCode& code, EmitContext& ctx, IR::Inst*
     code.vmovdqa(xmm0, code.BConst<esize>(xword, 1));
 
     // find value of last bit to be shifted off
-    WDQCODE(vpsub)(right_shift, shift_amount, xmm0);
+    ICODE(vpsub)(right_shift, shift_amount, xmm0);
     shift_right(right_shift, a, right_shift);
     code.vpand(right_shift, right_shift, xmm0);
     // compute standard right shift
     shift_right(xmm0, a, shift_amount);
     // combine results
-    WDQCODE(vpadd)(right_shift, xmm0, right_shift);
+    ICODE(vpadd)(right_shift, xmm0, right_shift);
 
     // blend based on the sign bit of the lowest byte of each element of b
     // using the sse forms of pblendv over avx because they have considerably better latency & throughput on intel processors
     // note that this uses xmm0 as an implicit argument
-    WDQCODE(vpsll)(xmm0, b, u8(esize - 8));
+    ICODE(vpsll)(xmm0, b, u8(esize - 8));
     if constexpr (esize == 16) {
         code.vpsraw(xmm0, xmm0, 15);
         code.pblendvb(left_shift, right_shift);
@@ -5355,39 +5353,39 @@ static void EmitVectorSaturatedShiftLeftAVX512(BlockOfCode& code, EmitContext& c
 
     const auto shift_right = [&](const Xbyak::Xmm& dst, const Xbyak::Xmm& src, const Xbyak::Xmm& amount) {
         if constexpr (is_signed) {
-            WDQCODE(vpsrav)(dst, src, amount);
+            ICODE(vpsrav)(dst, src, amount);
         } else {
-            WDQCODE(vpsrlv)(dst, src, amount);
+            ICODE(vpsrlv)(dst, src, amount);
         }
     };
 
-    WDQCODE(vpsll)(shift, shift, u8(esize - 8));
-    WDQCODE(vpsra)(shift, shift, u8(esize - 8));
+    ICODE(vpsll)(shift, shift, u8(esize - 8));
+    ICODE(vpsra)(shift, shift, u8(esize - 8));
 
     const Xbyak::Opmask negative_shift = k1;
     const Xbyak::Opmask overflow = k2;
     code.vpxor(xmm0, xmm0, xmm0);
-    WDQCODE(vpcmp)(negative_shift, shift, xmm0, CmpInt::LessThan);
+    ICODE(vpcmp)(negative_shift, shift, xmm0, CmpInt::LessThan);
     code.knotw(k3, negative_shift);
 
     // A left shift overflows if shifting back does not give the original element.
     // Shifting by esize or more gives zero, which only gives back zero.
-    WDQCODE(vpsllv)(result, data, shift);
+    ICODE(vpsllv)(result, data, shift);
     shift_right(tmp, result, shift);
-    WDQCODE(vpcmp)(overflow | k3, tmp, data, CmpInt::NotEqual);
+    ICODE(vpcmp)(overflow | k3, tmp, data, CmpInt::NotEqual);
 
     if constexpr (is_signed) {
-        WDQCODE(vpsra)(tmp, data, u8(esize - 1));
+        ICODE(vpsra)(tmp, data, u8(esize - 1));
         code.vpxor(tmp, tmp, code.BConst<esize>(xword, mcl::bit::ones<u64>(esize - 1)));
     } else {
         code.vpcmpeqd(tmp, tmp, tmp);
     }
-    WDQCODE(vpblendm)(result | overflow, result, tmp);
+    ICODE(vpblendm)(result | overflow, result, tmp);
 
     // Shifting right by esize or more gives the same result as shifting by esize - 1 (signed) or zero (unsigned)
-    WDQCODE(vpsub)(shift, xmm0, shift);
+    ICODE(vpsub)(shift, xmm0, shift);
     shift_right(tmp, data, shift);
-    WDQCODE(vpblendm)(result | negative_shift, result, tmp);
+    ICODE(vpblendm)(result | negative_shift, result, tmp);
 
     code.kmovw(bit, overflow);
     code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_qc], bit);
@@ -5550,13 +5548,7 @@ static void EmitVectorSaturatedShiftLeftWidenedAVX2(BlockOfCode& code, EmitConte
 
     // 8-bit results fit in 16 bits, so narrow them to 16 bits first
     if constexpr (esize == 8) {
-        if constexpr (is_signed) {
-            code.vpackssdw(wide[0], wide[0], wide[1]);
-            code.vpackssdw(wide[1], wide[2], wide[3]);
-        } else {
-            code.vpackusdw(wide[0], wide[0], wide[1]);
-            code.vpackusdw(wide[1], wide[2], wide[3]);
-        }
+        EmitWidenedPack8To16AVX2<is_signed>(code, wide);
     }
 
     // Saturation happened where a result does not fit in esize bits
@@ -5704,13 +5696,13 @@ static void EmitVectorSignedSaturatedShiftLeftUnsignedAVX512(BlockOfCode& code, 
         code.vpblendmb(result | overflow, result, ones);
         code.vpblendmb(result | negative, result, xmm0);
     } else {
-        WDQCODE(vpcmp)(negative, data, xmm0, CmpInt::LessThan);
-        WDQCODE(vpcmpu)(overflow, data, overflow_limit, CmpInt::GreaterThan);
+        ICODE(vpcmp)(negative, data, xmm0, CmpInt::LessThan);
+        ICODE(vpcmpu)(overflow, data, overflow_limit, CmpInt::GreaterThan);
 
-        WDQCODE(vpsll)(result, data, shift_amount);
+        ICODE(vpsll)(result, data, shift_amount);
 
-        WDQCODE(vpblendm)(result | overflow, result, ones);
-        WDQCODE(vpblendm)(result | negative, result, xmm0);
+        ICODE(vpblendm)(result | overflow, result, ones);
+        ICODE(vpblendm)(result | negative, result, xmm0);
     }
 
     code.korw(k3, negative, overflow);

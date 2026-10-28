@@ -241,6 +241,37 @@ bool WideInstruction(TranslatorVisitor& v, bool U, bool D, size_t sz, size_t Vn,
     return true;
 }
 
+bool AddNarrowHigh(TranslatorVisitor& v, size_t sz, size_t Vn, size_t Vd, bool D, bool N, bool M, size_t Vm, bool rounding) {
+    if (sz == 0b11) {
+        return v.UndefinedInstruction();
+    }
+
+    if (mcl::bit::get_bit<0>(Vn) || mcl::bit::get_bit<0>(Vm)) {
+        return v.UndefinedInstruction();
+    }
+
+    const size_t esize = 8U << sz;
+    const size_t source_esize = 2 * esize;
+    const auto d = ToVector(false, Vd, D);
+    const auto m = ToVector(true, Vm, M);
+    const auto n = ToVector(true, Vn, N);
+
+    const auto reg_n = v.ir.GetVector(n);
+    const auto reg_m = v.ir.GetVector(m);
+    auto sum = v.ir.VectorAdd(source_esize, reg_n, reg_m);
+
+    if (rounding) {
+        const u64 round_value = 1ULL << (esize - 1);
+        const auto round_vector = v.ir.VectorBroadcast(source_esize, v.I(source_esize, round_value));
+        sum = v.ir.VectorAdd(source_esize, sum, round_vector);
+    }
+
+    const auto shifted = v.ir.VectorLogicalShiftRight(source_esize, sum, static_cast<u8>(esize));
+    const auto result = v.ir.VectorNarrow(source_esize, shifted);
+    v.ir.SetVector(d, result);
+    return true;
+}
+
 }  // Anonymous namespace
 
 // ASIMD Three registers of the same length
@@ -909,6 +940,14 @@ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t
     return WideInstruction(*this, U, D, sz, Vn, Vd, N, M, Vm, op ? WidenBehaviour::Second : WidenBehaviour::Both, [this](size_t esize, const auto&, const auto& reg_n, const auto& reg_m) {
         return ir.VectorSub(esize, reg_n, reg_m);
     });
+}
+
+bool TranslatorVisitor::asimd_VADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
+    return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, false);
+}
+
+bool TranslatorVisitor::asimd_VRADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
+    return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, true);
 }
 
 bool TranslatorVisitor::asimd_VABAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {

@@ -942,12 +942,8 @@ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t
     });
 }
 
-bool TranslatorVisitor::asimd_VADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
-    return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, false);
-}
-
-bool TranslatorVisitor::asimd_VRADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
-    return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, true);
+bool TranslatorVisitor::asimd_VADDHN(bool R,bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+    return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, R);
 }
 
 bool TranslatorVisitor::asimd_VABAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {

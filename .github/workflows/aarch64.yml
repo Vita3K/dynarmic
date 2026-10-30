@@ -12,7 +12,7 @@ jobs:
         platform: [ linux, android ]
       fail-fast: false
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
 
@@ -20,9 +20,9 @@ jobs:
         run: >
           sudo apt-get update &&
           sudo apt-get install
-          gcc-aarch64-linux-gnu
-          g++-aarch64-linux-gnu
-          g++
+          gcc-10-aarch64-linux-gnu
+          g++-10-aarch64-linux-gnu
+          g++-10
           ninja-build
           qemu-user
 
@@ -42,8 +42,8 @@ jobs:
       - name: Configure CMake for AArch64 (Linux)
         if: matrix.platform == 'linux'
         env:
-          CC: aarch64-linux-gnu-gcc
-          CXX: aarch64-linux-gnu-g++
+          CC: aarch64-linux-gnu-gcc-10
+          CXX: aarch64-linux-gnu-g++-10
         run: >
           cmake
           -B ${{github.workspace}}/build-arm64
@@ -74,8 +74,8 @@ jobs:
       - name: Configure CMake for x86_64
         if: matrix.platform == 'linux'
         env:
-          CC: gcc
-          CXX: g++
+          CC: gcc-10
+          CXX: g++-10
         run: >
           cmake
           -B ${{github.workspace}}/build-x64

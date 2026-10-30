@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         # macos-latest is arm64; use an Intel runner to test the x86-64 backend.
-        os: [ windows-latest, ubuntu-latest, macos-15-intel ]
+        os: [ windows-latest, ubuntu-24.04, macos-15-intel ]
         cpu_detection: [ 0, 1 ]
       fail-fast: false
 
@@ -19,11 +19,11 @@ jobs:
     steps:
 
       - name: Install build dependencies
-        if: ${{matrix.os == 'ubuntu-latest'}}
+        if: ${{matrix.os == 'ubuntu-24.04'}}
         run: >
           sudo apt-get update &&
           sudo apt-get install
-          g++
+          g++-10
           llvm
           ninja-build
 
@@ -37,22 +37,22 @@ jobs:
           path: externals/ext-boost
 
       - name: Checkout unicorn repo
-        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
+        if: ${{matrix.os == 'ubuntu-24.04' || matrix.os == 'macos-15-intel'}}
         uses: actions/checkout@v5
         with:
           repository: yuzu-emu-mirror/unicorn
           path: externals/unicorn
 
       - name: Build unicorn
-        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
+        if: ${{matrix.os == 'ubuntu-24.04' || matrix.os == 'macos-15-intel'}}
         working-directory: externals/unicorn
         run: UNICORN_ARCHS=aarch64,arm ./make.sh
 
       - name: Configure CMake
-        if: ${{matrix.os == 'ubuntu-latest'}}
+        if: ${{matrix.os == 'ubuntu-24.04'}}
         env:
-          CC: gcc
-          CXX: g++
+          CC: gcc-10
+          CXX: g++-10
           CXXFLAGS: -Wp,-D_GLIBCXX_ASSERTIONS
         run: >
           cmake

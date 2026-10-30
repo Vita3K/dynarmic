@@ -243,7 +243,7 @@ bool WideInstruction(TranslatorVisitor& v, bool U, bool D, size_t sz, size_t Vn,
 
 bool AddNarrowHigh(TranslatorVisitor& v, size_t sz, size_t Vn, size_t Vd, bool D, bool N, bool M, size_t Vm, bool rounding) {
     if (sz == 0b11) {
-        return v.UndefinedInstruction();
+        return v.DecodeError();
     }
 
     if (mcl::bit::get_bit<0>(Vn) || mcl::bit::get_bit<0>(Vm)) {
@@ -942,7 +942,7 @@ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t
     });
 }
 
-bool TranslatorVisitor::asimd_VADDHN(bool R,bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+bool TranslatorVisitor::asimd_VADDHN(bool R, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
     return AddNarrowHigh(*this, sz, Vn, Vd, D, N, M, Vm, R);
 }
 

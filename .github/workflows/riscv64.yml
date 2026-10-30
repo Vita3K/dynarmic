@@ -12,7 +12,7 @@ jobs:
         platform: [ linux ]
       fail-fast: false
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
 
     steps:
 
@@ -20,8 +20,8 @@ jobs:
         run: >
           sudo apt-get update &&
           sudo apt-get install
-          gcc-10-riscv64-linux-gnu
-          g++-10-riscv64-linux-gnu
+          gcc-riscv64-linux-gnu
+          g++-riscv64-linux-gnu
           ninja-build
           qemu-user
 
@@ -41,8 +41,8 @@ jobs:
       - name: Configure CMake for RISCV64 (Linux)
         if: matrix.platform == 'linux'
         env:
-          CC: riscv64-linux-gnu-gcc-10
-          CXX: riscv64-linux-gnu-g++-10
+          CC: riscv64-linux-gnu-gcc
+          CXX: riscv64-linux-gnu-g++
         run: >
           cmake
           -B ${{github.workspace}}/build-riscv64

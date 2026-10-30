@@ -23,7 +23,7 @@ jobs:
         run: >
           sudo apt-get update &&
           sudo apt-get install
-          g++-10
+          g++
           llvm
           ninja-build
 
@@ -51,8 +51,8 @@ jobs:
       - name: Configure CMake
         if: ${{matrix.os == 'ubuntu-latest'}}
         env:
-          CC: gcc-10
-          CXX: g++-10
+          CC: gcc
+          CXX: g++
           CXXFLAGS: -Wp,-D_GLIBCXX_ASSERTIONS
         run: >
           cmake

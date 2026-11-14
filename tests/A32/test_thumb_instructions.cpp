@@ -4,10 +4,12 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <mcl/macro/architecture.hpp>
 #include <mcl/stdint.hpp>
 
 #include "./testenv.h"
 #include "dynarmic/interface/A32/a32.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 static Dynarmic::A32::UserConfig GetUserConfig(ThumbTestEnv* testenv) {
     Dynarmic::A32::UserConfig user_config;
@@ -252,3 +254,115 @@ TEST_CASE("thumb: Opt Failure: Get/Set Elimination for Flags 2", "[thumb]") {
     REQUIRE(jit.Regs() == expected);
     REQUIRE(jit.Cpsr() == 0x200001f0);
 }
+
+// The exclusive monitor is only built for the x64 and arm64 backends
+#if defined(MCL_ARCHITECTURE_X86_64) || defined(MCL_ARCHITECTURE_ARM64)
+
+static Dynarmic::A32::UserConfig GetUserConfig(ThumbTestEnv* testenv, Dynarmic::ExclusiveMonitor* monitor) {
+    Dynarmic::A32::UserConfig user_config = GetUserConfig(testenv);
+    user_config.global_monitor = monitor;
+    user_config.processor_id = 0;
+    return user_config;
+}
+
+TEST_CASE("thumb: strex r1, r1, [r2]", "[thumb]") {
+    // The status register is also the value: the value is stored, then the status is written.
+    ThumbTestEnv test_env;
+    Dynarmic::ExclusiveMonitor monitor{1};
+    Dynarmic::A32::Jit jit{GetUserConfig(&test_env, &monitor)};
+    test_env.code_mem = {
+        0xe852, 0x0f00,  // ldrex r0, [r2]
+        0xe842, 0x1100,  // strex r1, r1, [r2]
+        0xe7fe           // b +#0
+    };
+    test_env.PadCodeMem();
+
+    jit.Regs()[1] = 0x12345678;
+    jit.Regs()[2] = 0x00000100;
+    jit.Regs()[15] = 0;       // PC = 0
+    jit.SetCpsr(0x00000030);  // Thumb, User-mode
+
+    test_env.ticks_left = 2;
+    jit.Run();
+
+    REQUIRE(jit.Regs()[0] == 0x03020100);
+    REQUIRE(jit.Regs()[1] == 0);  // Succeeded
+    REQUIRE(jit.Regs()[2] == 0x00000100);
+    REQUIRE(jit.Regs()[15] == 8);
+    REQUIRE(test_env.MemoryRead32(0x100) == 0x12345678);
+}
+
+TEST_CASE("thumb: strex r1, r1, [r2] without a reservation", "[thumb]") {
+    ThumbTestEnv test_env;
+    Dynarmic::ExclusiveMonitor monitor{1};
+    Dynarmic::A32::Jit jit{GetUserConfig(&test_env, &monitor)};
+    test_env.code_mem = {
+        0xe842, 0x1100,  // strex r1, r1, [r2]
+        0xe7fe           // b +#0
+    };
+    test_env.PadCodeMem();
+
+    jit.Regs()[1] = 0x12345678;
+    jit.Regs()[2] = 0x00000100;
+    jit.Regs()[15] = 0;       // PC = 0
+    jit.SetCpsr(0x00000030);  // Thumb, User-mode
+
+    test_env.ticks_left = 1;
+    jit.Run();
+
+    REQUIRE(jit.Regs()[1] == 1);  // Failed
+    REQUIRE(jit.Regs()[15] == 4);
+    REQUIRE(test_env.modified_memory.empty());
+}
+
+TEST_CASE("thumb: strexb r1, r1, [r2]", "[thumb]") {
+    ThumbTestEnv test_env;
+    Dynarmic::ExclusiveMonitor monitor{1};
+    Dynarmic::A32::Jit jit{GetUserConfig(&test_env, &monitor)};
+    test_env.code_mem = {
+        0xe8d2, 0x0f4f,  // ldrexb r0, [r2]
+        0xe8c2, 0x1f41,  // strexb r1, r1, [r2]
+        0xe7fe           // b +#0
+    };
+    test_env.PadCodeMem();
+
+    jit.Regs()[1] = 0x12345678;
+    jit.Regs()[2] = 0x00000100;
+    jit.Regs()[15] = 0;       // PC = 0
+    jit.SetCpsr(0x00000030);  // Thumb, User-mode
+
+    test_env.ticks_left = 2;
+    jit.Run();
+
+    REQUIRE(jit.Regs()[0] == 0x00000000);
+    REQUIRE(jit.Regs()[1] == 0);  // Succeeded
+    REQUIRE(jit.Regs()[15] == 8);
+    REQUIRE(test_env.MemoryRead32(0x100) == 0x03020178);
+}
+
+TEST_CASE("thumb: strexh r1, r1, [r2]", "[thumb]") {
+    ThumbTestEnv test_env;
+    Dynarmic::ExclusiveMonitor monitor{1};
+    Dynarmic::A32::Jit jit{GetUserConfig(&test_env, &monitor)};
+    test_env.code_mem = {
+        0xe8d2, 0x0f5f,  // ldrexh r0, [r2]
+        0xe8c2, 0x1f51,  // strexh r1, r1, [r2]
+        0xe7fe           // b +#0
+    };
+    test_env.PadCodeMem();
+
+    jit.Regs()[1] = 0x12345678;
+    jit.Regs()[2] = 0x00000100;
+    jit.Regs()[15] = 0;       // PC = 0
+    jit.SetCpsr(0x00000030);  // Thumb, User-mode
+
+    test_env.ticks_left = 2;
+    jit.Run();
+
+    REQUIRE(jit.Regs()[0] == 0x00000100);
+    REQUIRE(jit.Regs()[1] == 0);  // Succeeded
+    REQUIRE(jit.Regs()[15] == 8);
+    REQUIRE(test_env.MemoryRead32(0x100) == 0x03025678);
+}
+
+#endif

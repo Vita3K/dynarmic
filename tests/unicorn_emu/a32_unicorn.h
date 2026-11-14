@@ -87,4 +87,6 @@ private:
     uc_hook mem_write_prot_hook{};
 
     std::vector<std::unique_ptr<Page>> pages;
+    std::unique_ptr<Page> last_page;
+    std::array<u8, 4096> last_page_initial_data;
 };

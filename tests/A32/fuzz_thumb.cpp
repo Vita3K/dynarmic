@@ -105,7 +105,7 @@ static bool DoesBehaviorMatch(const A32Unicorn<ThumbTestEnv>& uni, const A32::Ji
 }
 
 static void RunInstance(size_t run_number, ThumbTestEnv& test_env, A32Unicorn<ThumbTestEnv>& uni, A32::Jit& jit, const ThumbTestEnv::RegisterArray& initial_regs, size_t instruction_count, size_t instructions_to_execute_count) {
-    // Reset memory first: ClearPageCache() immediately maps the last page again from the current memory contents.
+    // Reset memory first: ClearPageCache() refreshes the last page from the current memory contents.
     test_env.modified_memory.clear();
     uni.ClearPageCache();
     jit.ClearCache();

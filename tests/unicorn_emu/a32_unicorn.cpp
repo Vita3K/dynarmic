@@ -43,7 +43,14 @@ A32Unicorn<TestEnvironment>::A32Unicorn(TestEnvironment& testenv)
     CHECKED(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)InterruptHook, this, BEGIN_ADDRESS, END_ADDRESS));
     CHECKED(uc_hook_add(uc, &mem_invalid_hook, UC_HOOK_MEM_INVALID, (void*)UnmappedMemoryHook, this, BEGIN_ADDRESS, END_ADDRESS));
     CHECKED(uc_hook_add(uc, &mem_write_prot_hook, UC_HOOK_MEM_WRITE, (void*)MemoryWriteHook, this, BEGIN_ADDRESS, END_ADDRESS));
-    MapPage(LAST_PAGE_ADDRESS);
+
+    // The test environment's memory is still in its initial state, which ClearPageCache() restores the last page to.
+    for (size_t i = 0; i < last_page_initial_data.size(); ++i)
+        last_page_initial_data[i] = testenv.MemoryRead8(static_cast<u32>(LAST_PAGE_ADDRESS + i));
+    last_page = std::make_unique<Page>();
+    last_page->address = LAST_PAGE_ADDRESS;
+    last_page->data = last_page_initial_data;
+    CHECKED(uc_mem_map_ptr(uc, LAST_PAGE_ADDRESS, last_page->data.size(), UC_PROT_READ, last_page->data.data()));
 }
 
 template<class TestEnvironment>
@@ -262,7 +269,13 @@ void A32Unicorn<TestEnvironment>::ClearPageCache() {
         CHECKED(uc_mem_unmap(uc, page->address, 4096));
     }
     pages.clear();
-    MapPage(LAST_PAGE_ADDRESS);
+
+    // Rebuilding the last page from the test environment on every call is slow, so it stays mapped and is refreshed
+    // from its initial contents and the bytes the test environment currently has modified there.
+    last_page->data = last_page_initial_data;
+    for (auto iter = testenv.modified_memory.lower_bound(LAST_PAGE_ADDRESS); iter != testenv.modified_memory.end(); ++iter) {
+        last_page->data[iter->first - LAST_PAGE_ADDRESS] = iter->second;
+    }
 }
 
 template<class TestEnvironment>

@@ -4,6 +4,7 @@
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <mcl/macro/architecture.hpp>
 #include <mcl/stdint.hpp>
 
 #include "./testenv.h"
@@ -13,13 +14,6 @@
 static Dynarmic::A32::UserConfig GetUserConfig(ThumbTestEnv* testenv) {
     Dynarmic::A32::UserConfig user_config;
     user_config.callbacks = testenv;
-    return user_config;
-}
-
-static Dynarmic::A32::UserConfig GetUserConfig(ThumbTestEnv* testenv, Dynarmic::ExclusiveMonitor* monitor) {
-    Dynarmic::A32::UserConfig user_config = GetUserConfig(testenv);
-    user_config.global_monitor = monitor;
-    user_config.processor_id = 0;
     return user_config;
 }
 
@@ -261,6 +255,16 @@ TEST_CASE("thumb: Opt Failure: Get/Set Elimination for Flags 2", "[thumb]") {
     REQUIRE(jit.Cpsr() == 0x200001f0);
 }
 
+// The exclusive monitor is only built for the x64 and arm64 backends
+#if defined(MCL_ARCHITECTURE_X86_64) || defined(MCL_ARCHITECTURE_ARM64)
+
+static Dynarmic::A32::UserConfig GetUserConfig(ThumbTestEnv* testenv, Dynarmic::ExclusiveMonitor* monitor) {
+    Dynarmic::A32::UserConfig user_config = GetUserConfig(testenv);
+    user_config.global_monitor = monitor;
+    user_config.processor_id = 0;
+    return user_config;
+}
+
 TEST_CASE("thumb: strex r1, r1, [r2]", "[thumb]") {
     // The status register is also the value: the value is stored, then the status is written.
     ThumbTestEnv test_env;
@@ -271,6 +275,7 @@ TEST_CASE("thumb: strex r1, r1, [r2]", "[thumb]") {
         0xe842, 0x1100,  // strex r1, r1, [r2]
         0xe7fe           // b +#0
     };
+    test_env.PadCodeMem();
 
     jit.Regs()[1] = 0x12345678;
     jit.Regs()[2] = 0x00000100;
@@ -295,6 +300,7 @@ TEST_CASE("thumb: strex r1, r1, [r2] without a reservation", "[thumb]") {
         0xe842, 0x1100,  // strex r1, r1, [r2]
         0xe7fe           // b +#0
     };
+    test_env.PadCodeMem();
 
     jit.Regs()[1] = 0x12345678;
     jit.Regs()[2] = 0x00000100;
@@ -318,6 +324,7 @@ TEST_CASE("thumb: strexb r1, r1, [r2]", "[thumb]") {
         0xe8c2, 0x1f41,  // strexb r1, r1, [r2]
         0xe7fe           // b +#0
     };
+    test_env.PadCodeMem();
 
     jit.Regs()[1] = 0x12345678;
     jit.Regs()[2] = 0x00000100;
@@ -342,6 +349,7 @@ TEST_CASE("thumb: strexh r1, r1, [r2]", "[thumb]") {
         0xe8c2, 0x1f51,  // strexh r1, r1, [r2]
         0xe7fe           // b +#0
     };
+    test_env.PadCodeMem();
 
     jit.Regs()[1] = 0x12345678;
     jit.Regs()[2] = 0x00000100;
@@ -356,3 +364,5 @@ TEST_CASE("thumb: strexh r1, r1, [r2]", "[thumb]") {
     REQUIRE(jit.Regs()[15] == 8);
     REQUIRE(test_env.MemoryRead32(0x100) == 0x03025678);
 }
+
+#endif

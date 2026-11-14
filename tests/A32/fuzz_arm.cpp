@@ -118,8 +118,10 @@ bool ShouldTestInst(u32 instruction, u32 pc, bool is_thumb, bool is_last_inst, A
 // MSR (immediate) encodings with an empty mask (the hint space) that look like those hints stop Unicorn 2 with
 // UC_ERR_INSN_INVALID, while we treat them as NOPs.
 bool IsHintDecodedAsWait(u32 instruction) {
+    // With cond == 0b1111 these bits encode Advanced SIMD instructions instead (e.g. 0xF320F001 is VHADD.U32 D15, D0, D1).
+    const u32 cond = instruction >> 28;
     const u32 hint = instruction & 0xFF;
-    return (instruction & 0x0FFFF000) == 0x0320F000 && hint >= 1 && hint <= 3;
+    return cond != 0b1111 && (instruction & 0x0FFFF000) == 0x0320F000 && hint >= 1 && hint <= 3;
 }
 
 u32 GenRandomArmInst(u32 pc, bool is_last_inst) {

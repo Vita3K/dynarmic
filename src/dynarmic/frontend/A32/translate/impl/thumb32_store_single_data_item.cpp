@@ -171,8 +171,8 @@ bool TranslatorVisitor::thumb32_STR_imm_1(Reg n, Reg t, bool P, bool U, Imm<8> i
     if (n == Reg::PC) {
         return UndefinedInstruction();
     }
-    // VITA3K: n == t preindex writeback is defined in vita cpu
-    if (t == Reg::PC || (!P && n == t)) {
+    // VITA3K: n == t writeback is defined in vita cpu, the value stored is the one before the writeback
+    if (t == Reg::PC) {
         return UnpredictableInstruction();
     }
     return StoreImmediate(*this, n, t, P, U, true, Imm<12>{imm8.ZeroExtend()}, StoreImmWordFn);

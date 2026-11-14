@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         # macos-latest is arm64; use an Intel runner to test the x86-64 backend.
-        os: [ windows-latest, ubuntu-24.04, macos-15-intel ]
+        os: [ windows-latest, ubuntu-latest, macos-15-intel ]
         cpu_detection: [ 0, 1 ]
       fail-fast: false
 
@@ -19,11 +19,11 @@ jobs:
     steps:
 
       - name: Install build dependencies
-        if: ${{matrix.os == 'ubuntu-24.04'}}
+        if: ${{matrix.os == 'ubuntu-latest'}}
         run: >
           sudo apt-get update &&
           sudo apt-get install
-          g++-10
+          g++
           llvm
           ninja-build
 
@@ -37,22 +37,30 @@ jobs:
           path: externals/ext-boost
 
       - name: Checkout unicorn repo
-        if: ${{matrix.os == 'ubuntu-24.04' || matrix.os == 'macos-15-intel'}}
+        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
         uses: actions/checkout@v5
         with:
-          repository: yuzu-emu-mirror/unicorn
+          repository: unicorn-engine/unicorn
+          ref: 2.1.4
           path: externals/unicorn
 
       - name: Build unicorn
-        if: ${{matrix.os == 'ubuntu-24.04' || matrix.os == 'macos-15-intel'}}
+        if: ${{matrix.os == 'ubuntu-latest' || matrix.os == 'macos-15-intel'}}
         working-directory: externals/unicorn
-        run: UNICORN_ARCHS=aarch64,arm ./make.sh
+        env:
+          # Unicorn builds a universal binary on macOS unless told otherwise.
+          ARCHFLAGS: -arch x86_64
+        run: |
+          # QEMU's own configure passes -fwrapv and -fno-strict-aliasing, but unicorn's CMake build doesn't.
+          # Without -fwrapv clang folds the signed overflow in neon_abd_s32 into abs(), which breaks SABD/SABA/VABD/VABA on 32-bit elements.
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-fwrapv -fno-strict-aliasing" -DBUILD_SHARED_LIBS=OFF -DUNICORN_ARCH="arm;aarch64" -DUNICORN_BUILD_TESTS=OFF -DUNICORN_INSTALL=OFF -G Ninja
+          cmake --build build
 
       - name: Configure CMake
-        if: ${{matrix.os == 'ubuntu-24.04'}}
+        if: ${{matrix.os == 'ubuntu-latest'}}
         env:
-          CC: gcc-10
-          CXX: g++-10
+          CC: gcc
+          CXX: g++
           CXXFLAGS: -Wp,-D_GLIBCXX_ASSERTIONS
         run: >
           cmake
@@ -63,7 +71,7 @@ jobs:
           -DDYNARMIC_TESTS_USE_UNICORN=1
           -DDYNARMIC_USE_LLVM=1
           -DLIBUNICORN_INCLUDE_DIR=${{github.workspace}}/externals/unicorn/include
-          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
+          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/build/libunicorn.a
           -G Ninja
 
       # Uses the Homebrew LLVM that is preinstalled on the runner image.
@@ -78,7 +86,7 @@ jobs:
           -DDYNARMIC_TESTS_USE_UNICORN=1
           -DDYNARMIC_USE_LLVM=1
           -DLIBUNICORN_INCLUDE_DIR=${{github.workspace}}/externals/unicorn/include
-          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/libunicorn.a
+          -DLIBUNICORN_LIBRARY=${{github.workspace}}/externals/unicorn/build/libunicorn.a
           -DLLVM_DIR=$(brew --prefix llvm@18)/lib/cmake/llvm
           -G Ninja
 

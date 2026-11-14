@@ -105,6 +105,8 @@ static bool DoesBehaviorMatch(const A32Unicorn<ThumbTestEnv>& uni, const A32::Ji
 }
 
 static void RunInstance(size_t run_number, ThumbTestEnv& test_env, A32Unicorn<ThumbTestEnv>& uni, A32::Jit& jit, const ThumbTestEnv::RegisterArray& initial_regs, size_t instruction_count, size_t instructions_to_execute_count) {
+    // Reset memory first: ClearPageCache() refreshes the last page from the current memory contents.
+    test_env.modified_memory.clear();
     uni.ClearPageCache();
     jit.ClearCache();
 
@@ -116,7 +118,6 @@ static void RunInstance(size_t run_number, ThumbTestEnv& test_env, A32Unicorn<Th
     jit.Regs() = initial_regs;
 
     // Run interpreter
-    test_env.modified_memory.clear();
     test_env.ticks_left = instructions_to_execute_count;
     uni.SetPC(uni.GetPC() | 1);
     uni.Run();
@@ -538,4 +539,29 @@ TEST_CASE("Verify fix for off by one error in MemoryRead32 worked", "[Thumb][Thu
     };
 
     RunInstance(1, test_env, uni, jit, initial_regs, 5, 5);
+}
+
+TEST_CASE("Verify writes from a previous run don't leak into the last page", "[Thumb][Thumb16]") {
+    ThumbTestEnv test_env;
+
+    // Prepare test subjects
+    A32Unicorn<ThumbTestEnv> uni{test_env};
+    A32::Jit jit{GetUserConfig(&test_env)};
+
+    ThumbTestEnv::RegisterArray initial_regs{};
+    initial_regs[0] = 0x12345678;
+    initial_regs[1] = 0xFFFFFFF0;  // In the last page, which A32Unicorn keeps mapped across runs
+
+    test_env.code_mem = {
+        0x6008,  // str r0, [r1]
+        0xE7FE,  // b +#0
+    };
+    RunInstance(1, test_env, uni, jit, initial_regs, 1, 2);
+
+    // Both must load the initial memory contents, not the value stored by the previous run.
+    test_env.code_mem = {
+        0x680A,  // ldr r2, [r1]
+        0xE7FE,  // b +#0
+    };
+    RunInstance(2, test_env, uni, jit, initial_regs, 1, 2);
 }

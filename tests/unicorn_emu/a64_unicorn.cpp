@@ -6,6 +6,7 @@
 #include "./a64_unicorn.h"
 
 #include <mcl/assert.hpp>
+#include <mcl/bit/bit_field.hpp>
 
 #define CHECKED(expr)                                                                                    \
     do {                                                                                                 \
@@ -21,6 +22,8 @@ constexpr u64 END_ADDRESS = ~u64(0);
 A64Unicorn::A64Unicorn(A64TestEnv& testenv)
         : testenv(testenv) {
     CHECKED(uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc));
+    // The default CPU is a Cortex-A72, which doesn't have the ARMv8.1+ instructions.
+    CHECKED(uc_ctl_set_cpu_model(uc, UC_CPU_ARM64_MAX));
     u64 fpv = 3 << 20;
     CHECKED(uc_reg_write(uc, UC_ARM64_REG_CPACR_EL1, &fpv));
     CHECKED(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)InterruptHook, this, BEGIN_ADDRESS, END_ADDRESS));
@@ -169,20 +172,20 @@ void A64Unicorn::DumpMemoryInformation() {
 void A64Unicorn::InterruptHook(uc_engine* uc, u32 int_number, void* user_data) {
     auto* this_ = static_cast<A64Unicorn*>(user_data);
 
-    u32 esr;
-    CHECKED(uc_reg_read(uc, UC_ARM64_REG_ESR, &esr));
-
-    auto ec = esr >> 26;
-    auto iss = esr & 0xFFFFFF;
-
-    switch (ec) {
-    case 0x15:  // SVC
-        this_->testenv.CallSVC(iss);
-        break;
-    default:
-        this_->testenv.interrupts.emplace_back(fmt::format("Unhandled interrupt: int_number: {:#x}, esr: {:#x} (ec: {:#x}, iss: {:#x})", int_number, esr, ec, iss));
-        break;
+    // Unicorn 2 calls this hook instead of taking the exception, so ESR_EL1 never receives the syndrome.
+    // An SVC leaves the PC on the next instruction, so take the immediate from the SVC instruction itself.
+    constexpr u32 excp_swi = 2;  // QEMU's exception number for SVC
+    const u64 pc = this_->GetPC();
+    if (int_number == excp_swi) {
+        u32 inst;
+        CHECKED(uc_mem_read(uc, pc - 4, &inst, sizeof(inst)));
+        if ((inst & 0xFFE0001F) == 0xD4000001) {  // SVC #imm16
+            this_->testenv.CallSVC(mcl::bit::get_bits<5, 20>(inst));
+            return;
+        }
     }
+
+    this_->testenv.interrupts.emplace_back(fmt::format("Unhandled interrupt: int_number: {:#x}, pc: {:#x}", int_number, pc));
 }
 
 bool A64Unicorn::UnmappedMemoryHook(uc_engine* uc, uc_mem_type /*type*/, u64 start_address, int size, u64 /*value*/, void* user_data) {

@@ -4,6 +4,7 @@
  */
 
 #include <array>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -56,6 +57,28 @@ TEST_CASE("Unicorn: Ensure 0xFFFF'FFFF'FFFF'FFFF is readable", "[a64]") {
     env.ticks_left = 2;
     unicorn.Run();
 
+    REQUIRE(unicorn.GetPC() == 4);
+}
+
+TEST_CASE("Unicorn: SVC passes its immediate to CallSVC", "[a64]") {
+    struct SvcTestEnv final : A64TestEnv {
+        std::vector<u32> svc_calls;
+        void CallSVC(std::uint32_t swi) override { svc_calls.emplace_back(swi); }
+    };
+    SvcTestEnv env;
+
+    env.code_mem.emplace_back(0xd4024681);  // SVC #0x1234
+    env.code_mem.emplace_back(0x14000000);  // B .
+
+    A64Unicorn unicorn{env};
+
+    unicorn.SetPC(0);
+
+    env.ticks_left = 2;
+    unicorn.Run();
+
+    REQUIRE(env.interrupts.empty());
+    REQUIRE(env.svc_calls == std::vector<u32>{0x1234});
     REQUIRE(unicorn.GetPC() == 4);
 }
 

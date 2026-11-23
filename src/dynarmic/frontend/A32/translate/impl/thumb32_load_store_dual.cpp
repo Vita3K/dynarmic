@@ -224,7 +224,8 @@ bool TranslatorVisitor::thumb32_STREX(Reg n, Reg t, Reg d, Imm<8> imm8) {
     if (d == Reg::PC || t == Reg::PC || n == Reg::PC) {
         return UnpredictableInstruction();
     }
-    if (d == n || d == t) {
+    // VITA3K: d == t is defined in vita cpu, the value stored is the one before the status is written
+    if (d == n) {
         return UnpredictableInstruction();
     }
 
@@ -239,7 +240,8 @@ bool TranslatorVisitor::thumb32_STREXB(Reg n, Reg t, Reg d) {
     if (d == Reg::PC || t == Reg::PC || n == Reg::PC) {
         return UnpredictableInstruction();
     }
-    if (d == n || d == t) {
+    // VITA3K: d == t is defined in vita cpu, the value stored is the one before the status is written
+    if (d == n) {
         return UnpredictableInstruction();
     }
 
@@ -270,7 +272,8 @@ bool TranslatorVisitor::thumb32_STREXH(Reg n, Reg t, Reg d) {
     if (d == Reg::PC || t == Reg::PC || n == Reg::PC) {
         return UnpredictableInstruction();
     }
-    if (d == n || d == t) {
+    // VITA3K: d == t is defined in vita cpu, the value stored is the one before the status is written
+    if (d == n) {
         return UnpredictableInstruction();
     }
 
